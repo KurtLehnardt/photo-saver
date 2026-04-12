@@ -19,6 +19,8 @@
   var activeLayer = 'a';
   var isShowingOverlay = false;
   var isShowingControls = false;
+  var source = localStorage.getItem('frameflow_source') || null; // 'local' or 'google'
+  var selectedAlbumIds = [];
 
   // DOM refs
   const layerA = document.getElementById('layer-a');
@@ -29,6 +31,8 @@
   const hiddenPanel = document.getElementById('hidden-panel');
   const loading = document.getElementById('loading');
   const wakeVideo = document.getElementById('wake-video');
+  const sourcePicker = document.getElementById('source-picker');
+  const albumPicker = document.getElementById('album-picker');
 
   // ===== Wake Lock =====
   function acquireWakeLock() {
@@ -56,11 +60,16 @@
 
   // ===== API =====
   function fetchSlides() {
+    var url = source === 'google' ? '/api/google/slides' : '/api/slides';
     var attempt = 0;
     var maxAttempts = 3;
 
     function tryFetch() {
-      return fetch('/api/slides').then(function(res) {
+      return fetch(url).then(function(res) {
+        if (res.status === 401 && source === 'google') {
+          window.location.href = '/api/google/auth';
+          return [];
+        }
         if (!res.ok) throw new Error('HTTP ' + res.status);
         return res.json();
       }).then(function(data) {
@@ -545,39 +554,246 @@
     }
   }
 
-  // ===== Init =====
-  function init() {
-    // Fetch settings
-    fetchSettings().then(function(savedSettings) {
+  // ===== Source Picker =====
+  function checkGoogleStatus() {
+    return fetch('/api/google/status').then(function(res) {
+      if (res.ok) {
+        return res.json().then(function(data) {
+          var statusText = document.getElementById('google-status-text');
+          if (!data.configured) {
+            statusText.textContent = 'Not configured on server';
+            document.getElementById('src-google').disabled = true;
+          } else if (data.authenticated) {
+            statusText.textContent = 'Connected \u2713';
+          } else {
+            statusText.textContent = 'Connect your account';
+          }
+          return data;
+        });
+      }
+      return { configured: false, authenticated: false };
+    }).catch(function() {
+      return { configured: false, authenticated: false };
+    });
+  }
+
+  function showSourcePicker() {
+    loading.classList.add('hidden');
+    sourcePicker.classList.remove('hidden');
+    albumPicker.classList.add('hidden');
+    checkGoogleStatus();
+  }
+
+  function selectSource(src) {
+    source = src;
+    localStorage.setItem('frameflow_source', src);
+
+    if (src === 'local') {
+      sourcePicker.classList.add('hidden');
+      startSlideshow();
+    } else if (src === 'google') {
+      checkGoogleStatus().then(function(status) {
+        if (!status.authenticated) {
+          window.location.href = '/api/google/auth';
+          return;
+        }
+        sourcePicker.classList.add('hidden');
+        showAlbumPicker();
+      });
+    }
+  }
+
+  // ===== Album Picker =====
+  function showAlbumPicker() {
+    albumPicker.classList.remove('hidden');
+    var grid = document.getElementById('album-grid');
+    grid.innerHTML = '<div class="loading-text">Loading albums...</div>';
+
+    fetch('/api/google/albums').then(function(res) {
+      if (res.status === 401) {
+        window.location.href = '/api/google/auth';
+        return null;
+      }
+      if (!res.ok) throw new Error('Failed to load albums');
+      return res.json();
+    }).then(function(data) {
+      if (!data) return;
+      grid.innerHTML = '';
+
+      if (data.albums.length === 0) {
+        grid.innerHTML = '<div class="loading-text">No albums found</div>';
+        return;
+      }
+
+      selectedAlbumIds = data.albums.filter(function(a) { return a.selected; }).map(function(a) { return a.id; });
+      updateStartButton();
+
+      data.albums.forEach(function(album) {
+        var card = document.createElement('div');
+        card.className = 'album-card' + (album.selected ? ' selected' : '');
+
+        var coverUrl = album.coverPhotoBaseUrl ? album.coverPhotoBaseUrl + '=w300-h300-c' : '';
+
+        card.innerHTML =
+          (coverUrl ? '<img src="' + coverUrl + '" alt="">' : '<div style="width:100%;aspect-ratio:1;background:#222"></div>') +
+          '<div class="album-info">' +
+            '<div class="album-name">' + escapeHtml(album.title) + '</div>' +
+            '<div class="album-count">' + album.mediaItemsCount + ' items</div>' +
+          '</div>' +
+          '<div class="album-check">' + (album.selected ? '\u2713' : '') + '</div>';
+
+        card.addEventListener('click', function() {
+          var idx = selectedAlbumIds.indexOf(album.id);
+          if (idx >= 0) {
+            selectedAlbumIds.splice(idx, 1);
+            card.classList.remove('selected');
+            card.querySelector('.album-check').textContent = '';
+          } else {
+            selectedAlbumIds.push(album.id);
+            card.classList.add('selected');
+            card.querySelector('.album-check').textContent = '\u2713';
+          }
+          updateStartButton();
+        });
+
+        grid.appendChild(card);
+      });
+    }).catch(function(err) {
+      grid.innerHTML = '<div class="loading-text">Failed to load albums</div>';
+      console.error('[app] Album load error:', err);
+    });
+  }
+
+  function updateStartButton() {
+    var btn = document.getElementById('btn-start-show');
+    btn.disabled = selectedAlbumIds.length === 0;
+    btn.textContent = selectedAlbumIds.length > 0
+      ? 'Start Slideshow (' + selectedAlbumIds.length + ' albums)'
+      : 'Select albums to start';
+  }
+
+  function startSlideshowFromAlbums() {
+    fetch('/api/google/select-albums', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ albumIds: selectedAlbumIds })
+    }).then(function() {
+      albumPicker.classList.add('hidden');
+      startSlideshow();
+    });
+  }
+
+  function escapeHtml(str) {
+    var div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  // ===== Start Slideshow (shared between sources) =====
+  function startSlideshow() {
+    loading.classList.remove('hidden');
+    loading.querySelector('.loading-text').textContent = 'Loading photos...';
+
+    return fetchSettings().then(function(savedSettings) {
       if (savedSettings) {
         Object.assign(settings, savedSettings);
       }
       applySettingsToUI();
-
-      // Fetch slides
       return fetchSlides();
     }).then(function(loadedSlides) {
       slides = loadedSlides;
 
       if (slides.length === 0) {
-        loading.querySelector('.loading-text').textContent = 'No photos found. Check server logs.';
+        loading.querySelector('.loading-text').textContent = 'No photos found.';
         return;
       }
 
-      // Build shuffle order
       buildShuffleOrder();
       shuffleIndex = 0;
 
-      // Hide loading screen
       loading.classList.add('hidden');
 
-      // Acquire wake lock
       acquireWakeLock();
 
-      // Show first slide
       showNext();
     });
   }
+
+  // ===== Init =====
+  function init() {
+    // Check URL params for OAuth callback
+    var urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('source') === 'google') {
+      source = 'google';
+      localStorage.setItem('frameflow_source', 'google');
+      window.history.replaceState({}, '', '/');
+    }
+    if (urlParams.get('error')) {
+      alert('Google auth error: ' + urlParams.get('error'));
+      window.history.replaceState({}, '', '/');
+    }
+
+    // If no source selected, show picker
+    if (!source) {
+      showSourcePicker();
+      return;
+    }
+
+    // If google source, check auth and go to album picker or slideshow
+    if (source === 'google') {
+      checkGoogleStatus().then(function(status) {
+        if (!status.authenticated) {
+          showSourcePicker();
+          return;
+        }
+        // Check if albums are already selected
+        var albumsStarted = false;
+        return fetch('/api/google/albums').then(function(res) {
+          if (res.ok) {
+            return res.json().then(function(data) {
+              var hasSelected = data.albums.some(function(a) { return a.selected; });
+              if (hasSelected) {
+                albumsStarted = true;
+                return startSlideshow();
+              }
+            });
+          }
+        }).catch(function() {}).then(function() {
+          if (!albumsStarted) {
+            showAlbumPicker();
+          }
+        });
+      });
+      return;
+    }
+
+    // Local source - start directly
+    startSlideshow();
+  }
+
+  // Source picker buttons
+  document.getElementById('src-local').addEventListener('click', function() { selectSource('local'); });
+  document.getElementById('src-google').addEventListener('click', function() { selectSource('google'); });
+
+  // Album picker buttons
+  document.getElementById('btn-back-source').addEventListener('click', function() {
+    albumPicker.classList.add('hidden');
+    source = null;
+    localStorage.removeItem('frameflow_source');
+    showSourcePicker();
+  });
+
+  document.getElementById('btn-start-show').addEventListener('click', function() { startSlideshowFromAlbums(); });
+
+  // Change source button
+  document.getElementById('btn-change-source').addEventListener('click', function() {
+    clearTimeout(timer);
+    settings.paused = true;
+    settingsPanel.classList.add('hidden');
+    source = null;
+    localStorage.removeItem('frameflow_source');
+    showSourcePicker();
+  });
 
   // Start
   init();

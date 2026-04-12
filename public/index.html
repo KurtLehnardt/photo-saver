@@ -78,6 +78,9 @@
         </div>
       </label>
       <div class="setting">
+        <button id="btn-change-source" class="action-btn">Change Photo Source</button>
+      </div>
+      <div class="setting">
         <button id="btn-rescan" class="action-btn">Rescan Photos Library</button>
       </div>
       <div class="setting">
@@ -103,6 +106,38 @@
   <!-- Loading screen -->
   <div id="loading">
     <div class="loading-text">Loading photos...</div>
+  </div>
+
+  <!-- Source picker screen -->
+  <div id="source-picker" class="hidden">
+    <div class="picker-container">
+      <h1 class="picker-title">FrameFlow</h1>
+      <p class="picker-subtitle">Choose your photo source</p>
+      <div class="source-options">
+        <button id="src-local" class="source-btn">
+          <div class="source-icon">📁</div>
+          <div class="source-label">Local Photos</div>
+          <div class="source-desc">Photos from this Mac</div>
+        </button>
+        <button id="src-google" class="source-btn">
+          <div class="source-icon">📷</div>
+          <div class="source-label">Google Photos</div>
+          <div class="source-desc" id="google-status-text">Connect your account</div>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Album picker screen -->
+  <div id="album-picker" class="hidden">
+    <div class="picker-container">
+      <div class="picker-header">
+        <button id="btn-back-source" class="back-btn">← Back</button>
+        <h2>Select Albums</h2>
+        <button id="btn-start-show" class="start-btn">Start Slideshow</button>
+      </div>
+      <div id="album-grid" class="album-grid"></div>
+    </div>
   </div>
 
   <script src="app.js"></script>
