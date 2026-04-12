@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="FrameFlow">
+  <title>FrameFlow</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Slideshow layers -->
+  <div id="slideshow">
+    <div id="layer-a" class="slide-layer active"></div>
+    <div id="layer-b" class="slide-layer"></div>
+  </div>
+
+  <!-- Tap overlay for hide action -->
+  <div id="overlay" class="hidden">
+    <button id="btn-hide" class="overlay-btn" title="Hide this photo">
+      <svg><use href="icons.svg#icon-hide"></use></svg>
+      <span>Hide</span>
+    </button>
+  </div>
+
+  <!-- Controls bar (bottom) -->
+  <div id="controls" class="hidden">
+    <button id="btn-prev" class="ctrl-btn" title="Previous">
+      <svg><use href="icons.svg#icon-prev"></use></svg>
+    </button>
+    <button id="btn-playpause" class="ctrl-btn" title="Play/Pause">
+      <svg><use href="icons.svg#icon-pause"></use></svg>
+    </button>
+    <button id="btn-next" class="ctrl-btn" title="Next">
+      <svg><use href="icons.svg#icon-next"></use></svg>
+    </button>
+    <button id="btn-settings" class="ctrl-btn" title="Settings">
+      <svg><use href="icons.svg#icon-settings"></use></svg>
+    </button>
+  </div>
+
+  <!-- Settings panel -->
+  <div id="settings-panel" class="hidden">
+    <div class="settings-header">
+      <h2>Settings</h2>
+      <button id="btn-close-settings" class="ctrl-btn">
+        <svg><use href="icons.svg#icon-close"></use></svg>
+      </button>
+    </div>
+    <div class="settings-body">
+      <label class="setting">
+        <span>Shuffle</span>
+        <input type="checkbox" id="set-shuffle">
+      </label>
+      <label class="setting">
+        <span>Transition</span>
+        <select id="set-transition">
+          <option value="fade">Fade</option>
+          <option value="slide">Slide</option>
+          <option value="dissolve">Dissolve</option>
+          <option value="none">None</option>
+        </select>
+      </label>
+      <label class="setting">
+        <span>Ken Burns Effect</span>
+        <input type="checkbox" id="set-kenburns">
+      </label>
+      <label class="setting">
+        <span>Mute Videos</span>
+        <input type="checkbox" id="set-muted">
+      </label>
+      <label class="setting">
+        <span>Slide Duration</span>
+        <div class="range-group">
+          <input type="range" id="set-duration" min="3" max="30" step="1">
+          <span id="duration-value">8s</span>
+        </div>
+      </label>
+      <div class="setting">
+        <button id="btn-rescan" class="action-btn">Rescan Photos Library</button>
+      </div>
+      <div class="setting">
+        <button id="btn-manage-hidden" class="action-btn">Manage Hidden Photos</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Hidden photos management panel -->
+  <div id="hidden-panel" class="hidden">
+    <div class="settings-header">
+      <h2>Hidden Photos</h2>
+      <button id="btn-close-hidden" class="ctrl-btn">
+        <svg><use href="icons.svg#icon-close"></use></svg>
+      </button>
+    </div>
+    <div id="hidden-grid" class="hidden-grid"></div>
+  </div>
+
+  <!-- Wake lock video (hidden) -->
+  <video id="wake-video" muted playsinline loop style="position:fixed;top:-1px;left:-1px;width:1px;height:1px;opacity:0.01;pointer-events:none;"></video>
+
+  <!-- Loading screen -->
+  <div id="loading">
+    <div class="loading-text">Loading photos...</div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
