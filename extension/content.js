@@ -750,8 +750,20 @@
       const video = document.createElement('video');
       video.autoplay = true;
       video.playsInline = true;
-      video.muted = isMuted;
-      video.onloadeddata = () => { errCount = 0; swapLayers(); /* no scheduleNext — wait for ended */ };
+      video.setAttribute('playsinline', '');
+      video.setAttribute('autoplay', '');
+      // Start muted to guarantee autoplay, unmute after playing starts
+      video.muted = true;
+      video.setAttribute('muted', '');
+      video.onplaying = () => {
+        if (!isMuted) { video.muted = false; }
+      };
+      video.onloadeddata = () => {
+        errCount = 0;
+        swapLayers();
+        // Explicitly try to play in case autoplay didn't fire
+        video.play().catch(() => {});
+      };
       video.onended = () => { showNext(); };
       video.onerror = () => { brokenUrls.add(item.url); errCount++; setTimeout(showNext, 200); };
       video.src = item.url;
