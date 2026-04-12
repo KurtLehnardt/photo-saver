@@ -9,6 +9,7 @@
   // ===== Persistent URL collector =====
   // This Set accumulates ALL photo URLs ever seen, even after DOM elements are removed
   const collectedUrls = new Set();
+  const brokenUrls = new Set(); // URLs that failed to load
   let photoUrls = []; // Array version for slideshow indexing
 
   let isRunning = false;
@@ -46,7 +47,7 @@
   // ===== Photo Scraping =====
   function isExcluded(url) {
     if (!url) return true;
-    if (url.startsWith('data:')) return true;
+    if (url.startsWith('data:') || url.startsWith('blob:')) return true;
     if (url === '' || url === 'about:blank') return true;
     if (url.length < 30) return true; // too short to be a photo URL
     for (const pattern of EXCLUDE_PATTERNS) {
@@ -412,8 +413,28 @@
     activeLayer = activeLayer === 'a' ? 'b' : 'a';
   }
 
+  let errorCount = 0; // consecutive errors
+  const MAX_CONSECUTIVE_ERRORS = 10;
+
   function loadSlide(index) {
     if (index < 0 || index >= photoUrls.length) return;
+
+    // Too many consecutive errors — stop trying
+    if (errorCount >= MAX_CONSECUTIVE_ERRORS) {
+      showStatus('Most photos failed to load. Try scrolling iCloud Photos first.');
+      errorCount = 0;
+      return;
+    }
+
+    const url = photoUrls[index];
+
+    // Skip known broken URLs
+    if (brokenUrls.has(url)) {
+      errorCount++;
+      setTimeout(showNext, 50);
+      return;
+    }
+
     const layer = getInactiveLayer();
     if (!layer) return;
 
@@ -421,14 +442,19 @@
     currentIndex = index;
 
     const img = document.createElement('img');
-    img.crossOrigin = 'anonymous';
     img.onload = () => {
+      errorCount = 0; // reset on success
       applyKenBurns(layer);
       swapLayers();
       scheduleNext();
     };
-    img.onerror = () => setTimeout(showNext, 100);
-    img.src = photoUrls[index];
+    img.onerror = () => {
+      brokenUrls.add(url);
+      errorCount++;
+      console.warn('[FrameFlow] Failed to load:', url.substring(0, 80) + '...');
+      setTimeout(showNext, 200);
+    };
+    img.src = url;
     layer.appendChild(img);
   }
 
