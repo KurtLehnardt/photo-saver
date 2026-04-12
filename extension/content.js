@@ -17,9 +17,14 @@
   let settings = {
     shuffle: true,
     transition: 'fade',
+    fill: 'contain',
     kenBurns: true,
     duration: 8
   };
+
+  function saveExtSettings() {
+    chrome.storage.local.set({ frameflow_settings: settings });
+  }
 
   let slideTimer = null;
   let controlsTimer = null;
@@ -327,7 +332,45 @@
       <button id="ff-prev" title="Previous">&#9664;</button>
       <button id="ff-playpause" title="Pause">&#10074;&#10074;</button>
       <button id="ff-next" title="Next">&#9654;</button>
+      <button id="ff-settings-btn" title="Settings">&#9881;</button>
       <button id="ff-exit" title="Exit">&#10005;</button>
+    `;
+
+    // Settings panel
+    const settingsPanel = document.createElement('div');
+    settingsPanel.id = 'ff-settings-panel';
+    settingsPanel.innerHTML = `
+      <div class="ff-settings-title">Settings</div>
+      <label class="ff-setting">
+        <span>Photo Fill</span>
+        <select id="ff-set-fill">
+          <option value="contain">Fit (show full photo)</option>
+          <option value="cover">Fill (crop to fill)</option>
+        </select>
+      </label>
+      <label class="ff-setting">
+        <span>Shuffle</span>
+        <input type="checkbox" id="ff-set-shuffle" ${settings.shuffle ? 'checked' : ''}>
+      </label>
+      <label class="ff-setting">
+        <span>Transition</span>
+        <select id="ff-set-transition">
+          <option value="fade" ${settings.transition === 'fade' ? 'selected' : ''}>Fade</option>
+          <option value="slide" ${settings.transition === 'slide' ? 'selected' : ''}>Slide</option>
+          <option value="none" ${settings.transition === 'none' ? 'selected' : ''}>None</option>
+        </select>
+      </label>
+      <label class="ff-setting">
+        <span>Ken Burns</span>
+        <input type="checkbox" id="ff-set-kenburns" ${settings.kenBurns ? 'checked' : ''}>
+      </label>
+      <label class="ff-setting">
+        <span>Duration</span>
+        <div class="ff-range-wrap">
+          <input type="range" id="ff-set-duration" min="3" max="30" value="${settings.duration}">
+          <span id="ff-duration-val">${settings.duration}s</span>
+        </div>
+      </label>
     `;
 
     const status = document.createElement('div');
@@ -339,20 +382,77 @@
 
     document.body.appendChild(overlay);
     document.body.appendChild(controls);
+    document.body.appendChild(settingsPanel);
     document.body.appendChild(status);
     document.body.appendChild(loader);
 
-    overlay.addEventListener('click', toggleControls);
+    overlay.addEventListener('click', (e) => {
+      // Close settings if open
+      const sp = document.getElementById('ff-settings-panel');
+      if (sp && sp.classList.contains('visible')) {
+        sp.classList.remove('visible');
+        return;
+      }
+      toggleControls();
+    });
     document.getElementById('ff-prev').addEventListener('click', (e) => { e.stopPropagation(); showPrev(); });
     document.getElementById('ff-next').addEventListener('click', (e) => { e.stopPropagation(); showNext(); });
     document.getElementById('ff-playpause').addEventListener('click', (e) => { e.stopPropagation(); togglePause(); });
     document.getElementById('ff-exit').addEventListener('click', (e) => { e.stopPropagation(); stopSlideshow(); });
 
+    // Settings button
+    document.getElementById('ff-settings-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      const sp = document.getElementById('ff-settings-panel');
+      sp.classList.toggle('visible');
+    });
+
+    // Settings controls
+    document.getElementById('ff-set-fill').addEventListener('change', (e) => {
+      settings.fill = e.target.value;
+      // Apply immediately to active layer
+      const active = getActiveLayerEl();
+      if (active) {
+        if (settings.fill === 'cover') {
+          active.classList.add('ff-fill-cover');
+        } else {
+          active.classList.remove('ff-fill-cover');
+        }
+      }
+      saveExtSettings();
+    });
+
+    document.getElementById('ff-set-shuffle').addEventListener('change', (e) => {
+      settings.shuffle = e.target.checked;
+      if (settings.shuffle) buildShuffleOrder();
+      saveExtSettings();
+    });
+
+    document.getElementById('ff-set-transition').addEventListener('change', (e) => {
+      settings.transition = e.target.value;
+      saveExtSettings();
+    });
+
+    document.getElementById('ff-set-kenburns').addEventListener('change', (e) => {
+      settings.kenBurns = e.target.checked;
+      saveExtSettings();
+    });
+
+    document.getElementById('ff-set-duration').addEventListener('input', (e) => {
+      settings.duration = parseInt(e.target.value, 10);
+      document.getElementById('ff-duration-val').textContent = settings.duration + 's';
+    });
+
+    document.getElementById('ff-set-duration').addEventListener('change', (e) => {
+      settings.duration = parseInt(e.target.value, 10);
+      saveExtSettings();
+    });
+
     document.addEventListener('keydown', handleKeydown);
   }
 
   function removeOverlay() {
-    ['frameflow-overlay', 'frameflow-controls', 'frameflow-status', 'frameflow-loader'].forEach(id => {
+    ['frameflow-overlay', 'frameflow-controls', 'ff-settings-panel', 'frameflow-status', 'frameflow-loader'].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.remove();
     });
@@ -454,7 +554,7 @@
   function clearLayer(layer) {
     if (!layer) return;
     KB_CLASSES.forEach(c => layer.classList.remove(c));
-    layer.classList.remove('ff-kenburns', 'slide-enter', 'slide-exit', 'no-transition');
+    layer.classList.remove('ff-kenburns', 'slide-enter', 'slide-exit', 'no-transition', 'ff-fill-cover');
     layer.innerHTML = '';
   }
 
@@ -510,6 +610,11 @@
 
     clearLayer(layer);
     currentIndex = index;
+
+    // Apply fill mode
+    if (settings.fill === 'cover') {
+      layer.classList.add('ff-fill-cover');
+    }
 
     const img = document.createElement('img');
     img.onload = () => {

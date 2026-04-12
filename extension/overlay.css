@@ -85,6 +85,15 @@
 #frameflow-overlay .ff-kb-3 img { animation-name: ff-kb-3; }
 #frameflow-overlay .ff-kb-4 img { animation-name: ff-kb-4; }
 
+/* Fill cover mode */
+#frameflow-overlay .ff-fill-cover img {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: cover;
+}
+
 /* Controls */
 #frameflow-controls {
   position: fixed;
@@ -171,6 +180,119 @@
 #frameflow-loader .ff-label {
   font-size: 16px;
   color: rgba(255,255,255,0.5);
+}
+
+/* Settings panel */
+#ff-settings-panel {
+  position: fixed;
+  top: 50%;
+  right: 20px;
+  transform: translateY(-50%) translateX(120%);
+  z-index: 1000001;
+  width: 280px;
+  background: rgba(20, 20, 20, 0.95);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-radius: 12px;
+  padding: 20px;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  color: #fff;
+  transition: transform 0.3s ease;
+}
+
+#ff-settings-panel.visible {
+  transform: translateY(-50%) translateX(0);
+}
+
+.ff-settings-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+}
+
+.ff-setting {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 0;
+  font-size: 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+.ff-setting select {
+  background: rgba(255,255,255,0.1);
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 13px;
+  -webkit-appearance: none;
+}
+
+.ff-setting input[type="checkbox"] {
+  width: 40px;
+  height: 22px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255,255,255,0.2);
+  border-radius: 11px;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.ff-setting input[type="checkbox"]:checked {
+  background: #34c759;
+}
+
+.ff-setting input[type="checkbox"]::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.ff-setting input[type="checkbox"]:checked::after {
+  transform: translateX(18px);
+}
+
+.ff-range-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ff-range-wrap input[type="range"] {
+  width: 90px;
+  -webkit-appearance: none;
+  height: 4px;
+  background: rgba(255,255,255,0.3);
+  border-radius: 2px;
+  border: none;
+  outline: none;
+}
+
+.ff-range-wrap input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  background: #fff;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+#ff-duration-val {
+  font-size: 12px;
+  color: rgba(255,255,255,0.6);
+  min-width: 24px;
+  text-align: right;
 }
 
 @media (prefers-reduced-motion: reduce) {
