@@ -7,9 +7,15 @@ const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 
 function getRedirectUri(req) {
-  const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-  const host = req.headers['x-forwarded-host'] || req.get('host');
-  return `${protocol}://${host}/api/google/callback`;
+  // For Vercel/production, use the real host
+  if (req.headers['x-forwarded-host']) {
+    const protocol = req.headers['x-forwarded-proto'] || 'https';
+    const host = req.headers['x-forwarded-host'];
+    return `${protocol}://${host}/api/google/callback`;
+  }
+  // For local dev, always use localhost (Google OAuth blocks private IPs)
+  const port = req.socket.localPort || 3000;
+  return `http://localhost:${port}/api/google/callback`;
 }
 
 // Middleware to ensure valid access token
