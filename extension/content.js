@@ -130,132 +130,155 @@
   }
 
   // ===== Hi-Res Mode =====
+  // User manually opens a photo first (one click), then we capture + auto-advance.
   async function loadHiResPhotos(target, onProgress, onDone) {
     const maxTarget = target || 10;
-    console.log('[FrameFlow] Hi-res: target', maxTarget);
     const overlay = document.getElementById('frameflow-overlay');
 
     // Check if we already have enough cached photos
     if (collectedUrls.size >= maxTarget) {
-      console.log('[FrameFlow] Already have', collectedUrls.size, 'photos cached, skipping capture');
+      console.log('[FrameFlow] Using', collectedUrls.size, 'cached photos');
       onDone();
       return;
     }
 
-    // Hide overlay
+    // Hide overlay and show instructions
     if (overlay) overlay.style.display = 'none';
-    await new Promise(r => setTimeout(r, 1000));
+    const ld = document.getElementById('frameflow-loader');
+    if (ld) ld.style.display = 'none';
 
-    // Find a photo to click using iframe-reported positions
-    let clickPos = null;
+    const instrDiv = document.createElement('div');
+    instrDiv.id = 'ff-hires-instructions';
+    instrDiv.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:999998;background:rgba(0,0,0,0.75);display:flex;align-items:center;justify-content:center;font-family:-apple-system,sans-serif;color:#fff;text-align:center;pointer-events:none;';
+    instrDiv.innerHTML = '<div style="max-width:400px;padding:40px;background:rgba(0,0,0,0.85);border-radius:16px;backdrop-filter:blur(20px);pointer-events:auto">' +
+      '<div style="font-size:22px;font-weight:700;margin-bottom:12px">Click any photo</div>' +
+      '<div style="font-size:15px;color:rgba(255,255,255,0.6);margin-bottom:20px">Click a photo in iCloud to open it full-size.<br>FrameFlow will then auto-capture ' + maxTarget + ' photos.</div>' +
+      '<div style="font-size:13px;color:rgba(255,255,255,0.4)">Waiting for you to open a photo...</div>' +
+      '</div>';
+    document.body.appendChild(instrDiv);
 
-    if (iframePhotoPositions.length > 0) {
-      // Use the first photo position from the iframe
-      clickPos = iframePhotoPositions[0];
-      console.log('[FrameFlow] Using iframe photo position:', clickPos.x, clickPos.y, '(' + clickPos.w + 'x' + clickPos.h + ')');
-    }
+    // Wait for user to click a photo (detect by watching for a large image to appear)
+    let waitTimeout;
+    let checkCount = 0;
 
-    if (!clickPos) {
-      // Fallback: try finding in top document
-      for (const img of document.querySelectorAll('img')) {
-        if (img.naturalWidth < 30 || img.naturalHeight < 30) continue;
-        const rect = img.getBoundingClientRect();
-        if (rect.width > 20 && rect.height > 20 && rect.top > 50) {
-          clickPos = { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
-          console.log('[FrameFlow] Using top-frame photo position:', clickPos.x, clickPos.y);
-          break;
+    function checkForDetailView() {
+      checkCount++;
+      // Look across all docs for a large image (detail view)
+      let found = false;
+      const docs = [document];
+      document.querySelectorAll('iframe').forEach(f => {
+        try { if (f.contentDocument) docs.push(f.contentDocument); } catch (e) {}
+      });
+
+      for (const doc of docs) {
+        for (const img of doc.querySelectorAll('img')) {
+          // Detail view images are much larger than grid thumbnails
+          if (img.complete && img.naturalWidth > 500 && img.naturalHeight > 500) {
+            found = true;
+            break;
+          }
         }
+        if (found) break;
       }
+
+      // Also check if the page layout changed significantly (detail view has different structure)
+      if (!found) {
+        // Check for common detail view indicators
+        const fullscreenEls = document.querySelectorAll('[class*="detail"], [class*="viewer"], [class*="fullscreen"], [class*="preview"]');
+        if (fullscreenEls.length > 0) found = true;
+      }
+
+      if (found || checkCount > 300) { // 5 min timeout
+        instrDiv.remove();
+        if (found) {
+          console.log('[FrameFlow] Detail view detected! Starting capture.');
+          startCapture();
+        } else {
+          console.log('[FrameFlow] Timed out waiting for detail view');
+          if (overlay) overlay.style.display = '';
+          onDone();
+        }
+        return;
+      }
+
+      waitTimeout = setTimeout(checkForDetailView, 1000);
     }
 
-    if (!clickPos) {
-      // Last resort: click center of page (most likely has a photo there)
-      clickPos = { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) };
-      console.log('[FrameFlow] No photo found, clicking center:', clickPos.x, clickPos.y);
-    }
+    checkForDetailView();
 
-    // Click via debugger
-    console.log('[FrameFlow] Clicking at', clickPos.x, clickPos.y);
-    await sendRealClick(clickPos.x, clickPos.y);
-    await new Promise(r => setTimeout(r, 2500));
+    // The actual capture loop (runs after user opens a photo)
+    async function startCapture() {
+      // Wait a moment for the full-res image to load
+      await new Promise(r => setTimeout(r, 1500));
 
-    // Take a test screenshot to see if detail view opened
-    const testShot = await captureScreenshot();
-    if (testShot) {
-      console.log('[FrameFlow] Screenshot taken after click, starting capture loop');
-    }
+      let captured = 0;
+      let lastDataUrl = null;
+      let staleCount = 0;
 
-    // Capture loop
-    let captured = 0;
-    let lastDataUrl = null;
-    let staleCount = 0;
+      const progressDiv = document.createElement('div');
+      progressDiv.id = 'ff-hires-progress';
+      progressDiv.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:999999;background:rgba(0,0,0,0.85);backdrop-filter:blur(10px);padding:12px 24px;border-radius:10px;font-family:-apple-system,sans-serif;color:#fff;font-size:14px;pointer-events:none;';
+      progressDiv.textContent = 'Capturing 0 / ' + maxTarget;
+      document.body.appendChild(progressDiv);
 
-    const progressDiv = document.createElement('div');
-    progressDiv.id = 'ff-hires-progress';
-    progressDiv.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:999999;background:rgba(0,0,0,0.85);backdrop-filter:blur(10px);padding:12px 24px;border-radius:10px;font-family:-apple-system,sans-serif;color:#fff;font-size:14px;pointer-events:none;';
-    progressDiv.textContent = 'Capturing 0 / ' + maxTarget;
-    document.body.appendChild(progressDiv);
+      async function step() {
+        if (!isRunning || captured >= maxTarget) { finish(); return; }
 
-    async function step() {
-      if (!isRunning || captured >= maxTarget) { finish(); return; }
+        // Hide our progress indicator before screenshot
+        progressDiv.style.display = 'none';
+        await new Promise(r => setTimeout(r, 150));
 
-      // Hide ALL our UI before taking screenshot
-      progressDiv.style.display = 'none';
-      if (overlay) overlay.style.display = 'none';
-      // Small delay for browser to repaint without our elements
-      await new Promise(r => setTimeout(r, 100));
+        const dataUrl = await captureScreenshot();
 
-      const dataUrl = await captureScreenshot();
+        progressDiv.style.display = '';
 
-      // Show progress again
-      progressDiv.style.display = '';
+        if (dataUrl && dataUrl !== lastDataUrl) {
+          lastDataUrl = dataUrl;
+          collectedUrls.add(dataUrl);
+          captured++;
+          staleCount = 0;
+          progressDiv.textContent = 'Capturing ' + captured + ' / ' + maxTarget;
+          onProgress(captured);
+          photoUrls = Array.from(collectedUrls);
+        } else {
+          staleCount++;
+        }
 
-      if (dataUrl && dataUrl !== lastDataUrl) {
-        lastDataUrl = dataUrl;
-        collectedUrls.add(dataUrl);
-        captured++;
-        staleCount = 0;
-        progressDiv.textContent = 'Capturing ' + captured + ' / ' + maxTarget;
-        onProgress(captured);
+        if (staleCount > 8) { finish(); return; }
+
+        // Advance to next photo via debugger
+        await sendRealKey('ArrowRight');
+        // Wait for next photo to load
+        await new Promise(r => setTimeout(r, 2000));
+        scrollTimer = setTimeout(step, 100);
+      }
+
+      async function finish() {
+        progressDiv.remove();
+        // Close detail view
+        await sendRealKey('Escape');
+        await new Promise(r => setTimeout(r, 800));
+
         photoUrls = Array.from(collectedUrls);
-      } else {
-        staleCount++;
+        console.log('[FrameFlow] Captured', captured, 'photos');
+
+        // Show overlay and start slideshow
+        if (overlay) {
+          overlay.style.display = '';
+          overlay.classList.add('active');
+        }
+        const ld2 = document.getElementById('frameflow-loader');
+        if (ld2) ld2.style.display = 'none';
+
+        if (photoUrls.length > 0) {
+          buildShuffleOrder();
+          showNext();
+        }
+        onDone();
       }
 
-      if (staleCount > 5) { finish(); return; }
-
-      // Advance to next photo
-      await sendRealKey('ArrowRight');
-      await new Promise(r => setTimeout(r, 2000));
-      scrollTimer = setTimeout(step, 100);
+      step();
     }
-
-    async function finish() {
-      progressDiv.remove();
-      // Close iCloud detail view
-      await sendRealKey('Escape');
-      await new Promise(r => setTimeout(r, 800));
-
-      photoUrls = Array.from(collectedUrls);
-      console.log('[FrameFlow] Hi-res done:', captured, 'captured. Starting slideshow.');
-
-      // Now show overlay and start slideshow
-      if (overlay) {
-        overlay.style.display = '';
-        overlay.classList.add('active');
-      }
-      const ld = document.getElementById('frameflow-loader');
-      if (ld) ld.style.display = 'none';
-
-      if (photoUrls.length > 0) {
-        buildShuffleOrder();
-        showNext();
-      }
-
-      onDone();
-    }
-
-    step();
   }
 
   // ===== Shuffle =====
@@ -468,7 +491,7 @@
       }
 
       if (countEl) countEl.textContent = '0';
-      if (labelEl) labelEl.textContent = 'capturing hi-res photos...';
+      if (labelEl) labelEl.textContent = 'click any photo in iCloud to begin...';
 
       loadHiResPhotos(settings.targetPhotos || 10, (count) => {
         if (countEl) countEl.textContent = count + ' / ' + (settings.targetPhotos || 10);
