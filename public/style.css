@@ -504,6 +504,26 @@ html, body {
   color: rgba(255,255,255,0.5);
 }
 
+.disconnect-btn {
+  margin-top: 24px;
+  padding: 10px 20px;
+  background: transparent;
+  border: 1px solid rgba(255,100,100,0.4);
+  border-radius: 8px;
+  color: rgba(255,100,100,0.8);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.disconnect-btn:hover, .disconnect-btn:active {
+  background: rgba(255,100,100,0.1);
+  border-color: rgba(255,100,100,0.6);
+}
+
+.disconnect-btn.hidden {
+  display: none;
+}
+
 /* Album Picker */
 .picker-header {
   display: flex;

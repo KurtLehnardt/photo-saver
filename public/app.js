@@ -558,13 +558,17 @@
       if (res.ok) {
         return res.json().then(function(data) {
           var statusText = document.getElementById('google-status-text');
+          var disconnectBtn = document.getElementById('btn-disconnect-google');
           if (!data.configured) {
             statusText.textContent = 'Not configured on server';
             document.getElementById('src-google').disabled = true;
+            disconnectBtn.classList.add('hidden');
           } else if (data.authenticated) {
             statusText.textContent = 'Connected \u2713';
+            disconnectBtn.classList.remove('hidden');
           } else {
             statusText.textContent = 'Connect your account';
+            disconnectBtn.classList.add('hidden');
           }
           return data;
         });
@@ -741,6 +745,15 @@
   // Source picker buttons
   document.getElementById('src-local').addEventListener('click', function() { selectSource('local'); });
   document.getElementById('src-google').addEventListener('click', function() { selectSource('google'); });
+
+  // Disconnect Google account
+  document.getElementById('btn-disconnect-google').addEventListener('click', function() {
+    fetch('/api/google/logout', { method: 'POST' }).then(function() {
+      localStorage.removeItem('frameflow_source');
+      source = null;
+      checkGoogleStatus();
+    });
+  });
 
   // Pick new photos button (in settings, only visible for Google source)
   var btnPickPhotos = document.getElementById('btn-pick-photos');
