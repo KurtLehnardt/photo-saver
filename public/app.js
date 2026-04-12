@@ -616,11 +616,16 @@
   var pickerPollTimer = null;
 
   function openGooglePicker() {
+    // Open the popup IMMEDIATELY during the user click event
+    // (browsers block window.open inside async callbacks)
+    pickerWindow = window.open('about:blank', 'google-picker', 'width=800,height=600');
+
     loading.classList.remove('hidden');
     loading.querySelector('.loading-text').textContent = 'Opening Google Photos picker...';
 
     fetch('/api/google/picker', { method: 'POST' }).then(function(res) {
       if (res.status === 401) {
+        if (pickerWindow) pickerWindow.close();
         window.location.href = '/api/google/auth';
         return null;
       }
@@ -631,13 +636,20 @@
 
       loading.querySelector('.loading-text').textContent = 'Select photos in the Google picker window, then come back here.';
 
-      // Open Google's picker in a new window/tab
-      pickerWindow = window.open(data.pickerUri, 'google-picker', 'width=800,height=600');
+      // Navigate the already-opened window to the picker URL
+      if (pickerWindow && !pickerWindow.closed) {
+        pickerWindow.location.href = data.pickerUri;
+      } else {
+        // Popup was blocked anyway — fall back to redirect
+        window.location.href = data.pickerUri;
+        return;
+      }
 
       // Poll for completion
       pollPickerSession();
     }).catch(function(err) {
       console.error('[app] Picker error:', err);
+      if (pickerWindow && !pickerWindow.closed) pickerWindow.close();
       loading.querySelector('.loading-text').textContent = 'Failed to open picker. Tap to retry.';
       loading.addEventListener('click', function retry() {
         loading.removeEventListener('click', retry);
