@@ -224,57 +224,58 @@
   }
 
   // ===== Auto-scroll =====
-  function findScrollContainer() {
-    // Find the largest scrollable container
-    let best = null;
-    let bestScore = 0;
+  function findScrollContainers() {
+    // Find ALL scrollable containers (main doc + iframes)
+    const containers = [];
 
-    // Check all elements
-    const all = document.querySelectorAll('*');
-    for (const el of all) {
-      const style = window.getComputedStyle(el);
-      if (style.overflowY === 'scroll' || style.overflowY === 'auto') {
-        if (el.scrollHeight > el.clientHeight + 100) {
-          const score = el.scrollHeight - el.clientHeight;
-          if (score > bestScore) {
-            bestScore = score;
-            best = el;
-          }
-        }
-      }
-    }
-
-    // Also check iframes
-    document.querySelectorAll('iframe').forEach(iframe => {
+    function checkDoc(doc, win) {
       try {
-        if (!iframe.contentDocument) return;
-        const iframeAll = iframe.contentDocument.querySelectorAll('*');
-        for (const el of iframeAll) {
-          const style = iframe.contentWindow.getComputedStyle(el);
+        const all = doc.querySelectorAll('*');
+        for (const el of all) {
+          const style = win.getComputedStyle(el);
           if (style.overflowY === 'scroll' || style.overflowY === 'auto') {
             if (el.scrollHeight > el.clientHeight + 100) {
-              const score = el.scrollHeight - el.clientHeight;
-              if (score > bestScore) {
-                bestScore = score;
-                best = el;
-              }
+              containers.push({ el, score: el.scrollHeight - el.clientHeight });
             }
           }
         }
       } catch (e) {}
+    }
+
+    checkDoc(document, window);
+
+    document.querySelectorAll('iframe').forEach(iframe => {
+      try {
+        if (iframe.contentDocument && iframe.contentWindow) {
+          checkDoc(iframe.contentDocument, iframe.contentWindow);
+        }
+      } catch (e) {}
     });
 
-    console.log('[FrameFlow] Scroll container:', best ? best.tagName + '.' + best.className.substring(0, 50) : 'document');
-    return best || document.documentElement;
+    // Sort by scrollable area (largest first)
+    containers.sort((a, b) => b.score - a.score);
+
+    if (containers.length > 0) {
+      console.log('[FrameFlow] Found', containers.length, 'scroll containers. Best:',
+        containers[0].el.tagName + '.' + (containers[0].el.className || '').substring(0, 50),
+        'scrollHeight:', containers[0].el.scrollHeight);
+    } else {
+      console.log('[FrameFlow] No scroll containers found, using document');
+    }
+
+    return containers.length > 0 ? containers.map(c => c.el) : [document.documentElement];
   }
 
-  function autoScroll(onProgress, onComplete) {
-    const container = findScrollContainer();
+  function autoScroll(targetCount, onProgress, onComplete) {
+    const containers = findScrollContainers();
     let staleRounds = 0;
-    const maxStaleRounds = 15;
+    const maxStaleRounds = 20;
     let lastCount = collectedUrls.size;
 
     isScrolling = true;
+
+    console.log('[FrameFlow] Auto-scrolling UP to load ~' + (targetCount || 'all') + ' photos');
+    console.log('[FrameFlow] Using', containers.length, 'scroll container(s)');
 
     async function scrollTick() {
       if (!isScrolling) {
@@ -283,31 +284,52 @@
         return;
       }
 
-      // Scroll down
-      container.scrollTop += container.clientHeight * 0.8;
-      window.scrollBy(0, window.innerHeight * 0.8);
+      // Hit target?
+      if (targetCount > 0 && collectedUrls.size >= targetCount) {
+        console.log('[FrameFlow] Reached target of', targetCount, 'photos');
+        isScrolling = false;
+        clearInterval(scrollInterval);
+        onComplete();
+        return;
+      }
 
-      // Wait a moment for images to render, then scrape
-      await new Promise(r => setTimeout(r, 300));
+      // Scroll UP on all containers (going back in time in iCloud)
+      for (const container of containers) {
+        container.scrollTop = Math.max(0, container.scrollTop - container.clientHeight * 2);
+      }
+      window.scrollTo(0, 0);
+
+      // Wait for iCloud to render new photos
+      await new Promise(r => setTimeout(r, 800));
+      await scrapeAndCollect();
+
+      // Now scroll DOWN to load what appeared
+      for (const container of containers) {
+        container.scrollTop += container.clientHeight * 0.5;
+      }
+
+      await new Promise(r => setTimeout(r, 500));
       await scrapeAndCollect();
 
       const currentCount = collectedUrls.size;
       if (currentCount > lastCount) {
         staleRounds = 0;
         onProgress(currentCount);
+        console.log('[FrameFlow] Progress:', currentCount, '/', (targetCount || '∞'));
       } else {
         staleRounds++;
       }
       lastCount = currentCount;
 
       if (staleRounds >= maxStaleRounds) {
+        console.log('[FrameFlow] No new photos after', maxStaleRounds, 'rounds. Stopping scroll.');
         isScrolling = false;
         clearInterval(scrollInterval);
         onComplete();
       }
     }
 
-    scrollInterval = setInterval(scrollTick, 1500);
+    scrollInterval = setInterval(scrollTick, 2000);
   }
 
   function stopScrolling() {
@@ -406,6 +428,10 @@
       const sp = document.getElementById('ff-settings-panel');
       sp.classList.toggle('visible');
     });
+
+    // Prevent clicks inside settings panel from closing it or triggering overlay
+    settingsPanel.addEventListener('click', (e) => { e.stopPropagation(); });
+    settingsPanel.addEventListener('mousedown', (e) => { e.stopPropagation(); });
 
     // Settings controls
     document.getElementById('ff-set-fill').addEventListener('change', (e) => {
@@ -691,7 +717,8 @@
     }
 
     // Auto-scroll to load more
-    autoScroll(
+    const target = settings.targetPhotos || 500;
+    autoScroll(target,
       (count) => {
         photoUrls = Array.from(collectedUrls);
         if (countEl) countEl.textContent = count;

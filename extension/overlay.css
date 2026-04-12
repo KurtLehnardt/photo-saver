@@ -228,7 +228,12 @@
   border-radius: 6px;
   padding: 4px 8px;
   font-size: 13px;
-  -webkit-appearance: none;
+  -webkit-appearance: menulist;
+  appearance: menulist;
+  pointer-events: auto;
+  position: relative;
+  z-index: 1000002;
+  cursor: pointer;
 }
 
 .ff-setting input[type="checkbox"] {

@@ -12,6 +12,7 @@ chrome.storage.local.get(['frameflow_settings'], (result) => {
   if (s.shuffle !== undefined) document.getElementById('set-shuffle').checked = s.shuffle;
   if (s.transition) document.getElementById('set-transition').value = s.transition;
   if (s.fill) document.getElementById('set-fill').value = s.fill;
+  if (s.targetPhotos !== undefined) document.getElementById('set-photo-count').value = s.targetPhotos;
   if (s.kenBurns !== undefined) document.getElementById('set-kenburns').checked = s.kenBurns;
   if (s.duration) {
     document.getElementById('set-duration').value = s.duration;
@@ -25,7 +26,8 @@ function getSettings() {
     transition: document.getElementById('set-transition').value,
     fill: document.getElementById('set-fill').value,
     kenBurns: document.getElementById('set-kenburns').checked,
-    duration: parseInt(document.getElementById('set-duration').value, 10)
+    duration: parseInt(document.getElementById('set-duration').value, 10),
+    targetPhotos: parseInt(document.getElementById('set-photo-count').value, 10)
   };
 }
 
