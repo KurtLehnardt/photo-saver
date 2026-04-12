@@ -578,7 +578,6 @@
   function showSourcePicker() {
     loading.classList.add('hidden');
     sourcePicker.classList.remove('hidden');
-    albumPicker.classList.add('hidden');
     checkGoogleStatus();
   }
 
