@@ -90,10 +90,129 @@
       }
     }
 
+    // ===== Video detection and recording =====
+    let isRecording = false;
+
+    function detectMedia() {
+      // Check if the current detail view shows a video
+      const videos = document.querySelectorAll('video');
+      let bestVideo = null;
+      for (const v of videos) {
+        if (v.videoWidth > 100 && v.videoHeight > 100) {
+          bestVideo = v;
+          break;
+        }
+      }
+
+      if (bestVideo) {
+        window.top.postMessage({
+          type: 'FRAMEFLOW_MEDIA_TYPE',
+          mediaType: 'video',
+          duration: bestVideo.duration || 0,
+          width: bestVideo.videoWidth,
+          height: bestVideo.videoHeight
+        }, '*');
+      } else {
+        window.top.postMessage({ type: 'FRAMEFLOW_MEDIA_TYPE', mediaType: 'photo' }, '*');
+      }
+    }
+
+    async function recordVideo() {
+      if (isRecording) return;
+
+      const videos = document.querySelectorAll('video');
+      let video = null;
+      for (const v of videos) {
+        if (v.videoWidth > 100 && v.videoHeight > 100) { video = v; break; }
+      }
+
+      if (!video) {
+        window.top.postMessage({ type: 'FRAMEFLOW_VIDEO_DATA', data: null, error: 'No video found' }, '*');
+        return;
+      }
+
+      isRecording = true;
+      console.log('[FrameFlow/iframe] Recording video', video.videoWidth + 'x' + video.videoHeight, 'duration:', video.duration);
+
+      try {
+        // Ensure video is playing from the start
+        video.currentTime = 0;
+        video.play().catch(() => {});
+
+        // Get stream from video element
+        const stream = video.captureStream();
+
+        // Pick best supported codec
+        const codecs = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+        let mimeType = 'video/webm';
+        for (const c of codecs) {
+          if (MediaRecorder.isTypeSupported(c)) { mimeType = c; break; }
+        }
+
+        const recorder = new MediaRecorder(stream, { mimeType });
+        const chunks = [];
+
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) chunks.push(e.data);
+        };
+
+        recorder.onstop = async () => {
+          isRecording = false;
+          const blob = new Blob(chunks, { type: mimeType });
+          console.log('[FrameFlow/iframe] Video recorded:', (blob.size / 1024 / 1024).toFixed(1) + 'MB');
+
+          // Convert to ArrayBuffer and send to top frame
+          const buffer = await blob.arrayBuffer();
+          window.top.postMessage({
+            type: 'FRAMEFLOW_VIDEO_DATA',
+            data: buffer,
+            mimeType,
+            duration: video.duration,
+            width: video.videoWidth,
+            height: video.videoHeight
+          }, '*', [buffer]); // transfer, don't copy
+        };
+
+        recorder.onerror = () => {
+          isRecording = false;
+          window.top.postMessage({ type: 'FRAMEFLOW_VIDEO_DATA', data: null, error: 'Recording failed' }, '*');
+        };
+
+        recorder.start();
+
+        // Stop when video ends or after max duration
+        const maxDuration = Math.min((video.duration || 60) + 2, 120) * 1000;
+
+        const stopRecording = () => {
+          if (recorder.state === 'recording') {
+            recorder.stop();
+          }
+        };
+
+        video.addEventListener('ended', stopRecording, { once: true });
+        setTimeout(() => {
+          video.removeEventListener('ended', stopRecording);
+          stopRecording();
+        }, maxDuration);
+
+      } catch (e) {
+        isRecording = false;
+        console.warn('[FrameFlow/iframe] Video capture failed:', e.message);
+        window.top.postMessage({ type: 'FRAMEFLOW_VIDEO_DATA', data: null, error: e.message }, '*');
+      }
+    }
+
     // Listen for capture requests from top frame
     window.addEventListener('message', (e) => {
-      if (e.data && e.data.type === 'FRAMEFLOW_REQUEST_CAPTURE') {
+      if (!e.data) return;
+      if (e.data.type === 'FRAMEFLOW_REQUEST_CAPTURE') {
         capturelargestImage();
+      }
+      if (e.data.type === 'FRAMEFLOW_DETECT_MEDIA') {
+        detectMedia();
+      }
+      if (e.data.type === 'FRAMEFLOW_REQUEST_VIDEO_CAPTURE') {
+        recordVideo();
       }
     });
 
@@ -121,15 +240,29 @@
   // TOP FRAME INSTANCE — everything else
   // ================================================================
 
-  const collectedUrls = new Set();
+  // Media items: array of { type: 'photo'|'video', url: string }
+  const collectedMedia = [];
+  const collectedUrlSet = new Set(); // dedup
   const hiddenUrls = new Set();
   const brokenUrls = new Set();
+  let mediaItems = []; // filtered (non-hidden) items for slideshow
+  // Backward compat alias
   let photoUrls = [];
 
+  function addMedia(type, url) {
+    if (collectedUrlSet.has(url)) return false;
+    collectedUrlSet.add(url);
+    collectedMedia.push({ type, url });
+    return true;
+  }
+
   function rebuildPhotoUrls() {
-    photoUrls = rebuildPhotoUrls().filter(u => !hiddenUrls.has(u));
+    mediaItems = collectedMedia.filter(m => !hiddenUrls.has(m.url));
+    photoUrls = mediaItems.map(m => m.url);
     return photoUrls;
   }
+
+  let isMuted = false;
   let isRunning = false, isPaused = false;
   let settings = {
     shuffle: true, transition: 'fade', fill: 'contain',
@@ -144,7 +277,9 @@
   let iframePhotoPositions = [];
   let iframeElement = null;
   let iframeSource = null; // the iframe's contentWindow for sending messages back
-  let pendingPhotoResolve = null; // resolve function for waiting on a photo capture
+  let pendingPhotoResolve = null;
+  let pendingMediaTypeResolve = null;
+  let pendingVideoResolve = null;
   let iframeCanCapture = false; // whether the iframe can capture (same-origin)
 
   window.addEventListener('message', (e) => {
@@ -164,7 +299,6 @@
     }
 
     if (e.data.type === 'FRAMEFLOW_PHOTO_DATA') {
-      // Iframe successfully captured an image!
       iframeCanCapture = true;
       console.log('[FrameFlow] Received photo data from iframe:', e.data.width + 'x' + e.data.height);
 
@@ -172,9 +306,33 @@
         pendingPhotoResolve(e.data.dataUrl);
         pendingPhotoResolve = null;
       } else {
-        // Unsolicited capture (from periodic scanning) — add to collection
-        collectedUrls.add(e.data.dataUrl);
+        addMedia('photo', e.data.dataUrl);
         photoUrls = rebuildPhotoUrls();
+      }
+    }
+
+    // Media type detection response
+    if (e.data.type === 'FRAMEFLOW_MEDIA_TYPE') {
+      if (pendingMediaTypeResolve) {
+        pendingMediaTypeResolve(e.data);
+        pendingMediaTypeResolve = null;
+      }
+    }
+
+    // Video recording result
+    if (e.data.type === 'FRAMEFLOW_VIDEO_DATA') {
+      if (e.data.data) {
+        const blob = new Blob([e.data.data], { type: e.data.mimeType || 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        addMedia('video', url);
+        photoUrls = rebuildPhotoUrls();
+        console.log('[FrameFlow] Received video:', (blob.size / 1024 / 1024).toFixed(1) + 'MB');
+      } else {
+        console.warn('[FrameFlow] Video capture failed:', e.data.error);
+      }
+      if (pendingVideoResolve) {
+        pendingVideoResolve(e.data.data ? true : false);
+        pendingVideoResolve = null;
       }
     }
   });
@@ -191,6 +349,30 @@
           resolve(null);
         }
       }, timeoutMs || 3000);
+    });
+  }
+
+  // Ask iframe what media type the detail view is showing
+  function requestMediaType(timeoutMs) {
+    return new Promise(resolve => {
+      if (!iframeSource) { resolve({ mediaType: 'photo' }); return; }
+      iframeSource.postMessage({ type: 'FRAMEFLOW_DETECT_MEDIA' }, '*');
+      pendingMediaTypeResolve = resolve;
+      setTimeout(() => {
+        if (pendingMediaTypeResolve === resolve) { pendingMediaTypeResolve = null; resolve({ mediaType: 'photo' }); }
+      }, timeoutMs || 2000);
+    });
+  }
+
+  // Ask iframe to record the current video
+  function requestVideoCapture(timeoutMs) {
+    return new Promise(resolve => {
+      if (!iframeSource) { resolve(false); return; }
+      iframeSource.postMessage({ type: 'FRAMEFLOW_REQUEST_VIDEO_CAPTURE' }, '*');
+      pendingVideoResolve = resolve;
+      setTimeout(() => {
+        if (pendingVideoResolve === resolve) { pendingVideoResolve = null; resolve(false); }
+      }, timeoutMs || 120000); // up to 2 min for long videos
     });
   }
 
@@ -268,8 +450,8 @@
     const overlay = document.getElementById('frameflow-overlay');
 
     // Check if we already have enough cached photos
-    if (collectedUrls.size >= maxTarget) {
-      console.log('[FrameFlow] Using', collectedUrls.size, 'cached photos');
+    if (collectedMedia.length >= maxTarget) {
+      console.log('[FrameFlow] Using', collectedMedia.length, 'cached photos');
       onDone();
       return;
     }
@@ -355,30 +537,61 @@
       async function step() {
         if (!isRunning || captured >= maxTarget) { finish(); return; }
 
-        // Try iframe capture first (direct image data, no UI chrome)
-        let dataUrl = await requestIframeCapture(2000);
+        // Detect if this is a video or photo
+        const mediaInfo = await requestMediaType(1500);
 
-        // Fallback to screenshot if iframe can't capture
-        if (!dataUrl) {
-          progressDiv.style.display = 'none';
-          await new Promise(r => setTimeout(r, 150));
-          dataUrl = await captureScreenshot();
-          progressDiv.style.display = '';
-        }
+        if (mediaInfo.mediaType === 'video') {
+          // Record the video
+          progressDiv.textContent = 'Recording video ' + (captured + 1) + ' / ' + maxTarget + '...';
+          console.log('[FrameFlow] Video detected, recording... duration:', mediaInfo.duration);
 
-        if (dataUrl && dataUrl !== lastDataUrl) {
-          lastDataUrl = dataUrl;
-          collectedUrls.add(dataUrl);
-          captured++;
-          staleCount = 0;
-          progressDiv.textContent = 'Capturing ' + captured + ' / ' + maxTarget;
-          onProgress(captured);
-          photoUrls = rebuildPhotoUrls();
-
-          const method = iframeCanCapture ? 'direct capture' : 'screenshot';
-          console.log('[FrameFlow] #' + captured + ' via ' + method);
+          const success = await requestVideoCapture((mediaInfo.duration || 60) * 1000 + 5000);
+          if (success) {
+            captured++;
+            staleCount = 0;
+            progressDiv.textContent = 'Captured ' + captured + ' / ' + maxTarget;
+            onProgress(captured);
+            photoUrls = rebuildPhotoUrls();
+            console.log('[FrameFlow] #' + captured + ' video recorded');
+          } else {
+            // Video recording failed — capture a screenshot instead
+            console.log('[FrameFlow] Video recording failed, capturing screenshot');
+            let dataUrl = await requestIframeCapture(2000);
+            if (!dataUrl) {
+              progressDiv.style.display = 'none';
+              await new Promise(r => setTimeout(r, 150));
+              dataUrl = await captureScreenshot();
+              progressDiv.style.display = '';
+            }
+            if (dataUrl) {
+              addMedia('photo', dataUrl);
+              captured++;
+              photoUrls = rebuildPhotoUrls();
+            }
+            staleCount++;
+          }
         } else {
-          staleCount++;
+          // Photo — existing capture logic
+          let dataUrl = await requestIframeCapture(2000);
+          if (!dataUrl) {
+            progressDiv.style.display = 'none';
+            await new Promise(r => setTimeout(r, 150));
+            dataUrl = await captureScreenshot();
+            progressDiv.style.display = '';
+          }
+
+          if (dataUrl && dataUrl !== lastDataUrl) {
+            lastDataUrl = dataUrl;
+            addMedia('photo', dataUrl);
+            captured++;
+            staleCount = 0;
+            progressDiv.textContent = 'Capturing ' + captured + ' / ' + maxTarget;
+            onProgress(captured);
+            photoUrls = rebuildPhotoUrls();
+            console.log('[FrameFlow] #' + captured + ' photo captured');
+          } else {
+            staleCount++;
+          }
         }
 
         if (staleCount > 8) { finish(); return; }
@@ -447,6 +660,9 @@
   function getActive() { return document.getElementById(activeLayer === 'a' ? 'ff-layer-a' : 'ff-layer-b'); }
   function clearLayer(l) {
     if (!l) return;
+    // Stop any playing video
+    const vid = l.querySelector('video');
+    if (vid) { vid.pause(); vid.src = ''; }
     KB.forEach(c => l.classList.remove(c));
     l.classList.remove('ff-kenburns', 'slide-enter', 'slide-exit', 'no-transition', 'ff-fill-cover');
     l.innerHTML = '';
@@ -468,20 +684,33 @@
 
   let errCount = 0;
   function loadSlide(idx) {
-    if (idx < 0 || idx >= photoUrls.length) return;
-    if (errCount >= 10) { showStatus('Many photos failed to load.'); errCount = 0; return; }
-    const url = photoUrls[idx];
-    if (brokenUrls.has(url)) { errCount++; setTimeout(showNext, 50); return; }
+    if (idx < 0 || idx >= mediaItems.length) return;
+    if (errCount >= 10) { showStatus('Many items failed to load.'); errCount = 0; return; }
+    const item = mediaItems[idx];
+    if (brokenUrls.has(item.url)) { errCount++; setTimeout(showNext, 50); return; }
     const layer = getInactive();
     if (!layer) return;
     clearLayer(layer);
     currentIndex = idx;
     if (settings.fill === 'cover') layer.classList.add('ff-fill-cover');
-    const img = document.createElement('img');
-    img.onload = () => { errCount = 0; applyKenBurns(layer); swapLayers(); scheduleNext(); };
-    img.onerror = () => { brokenUrls.add(url); errCount++; setTimeout(showNext, 200); };
-    img.src = url;
-    layer.appendChild(img);
+
+    if (item.type === 'video') {
+      const video = document.createElement('video');
+      video.autoplay = true;
+      video.playsInline = true;
+      video.muted = isMuted;
+      video.onloadeddata = () => { errCount = 0; swapLayers(); /* no scheduleNext — wait for ended */ };
+      video.onended = () => { showNext(); };
+      video.onerror = () => { brokenUrls.add(item.url); errCount++; setTimeout(showNext, 200); };
+      video.src = item.url;
+      layer.appendChild(video);
+    } else {
+      const img = document.createElement('img');
+      img.onload = () => { errCount = 0; applyKenBurns(layer); swapLayers(); scheduleNext(); };
+      img.onerror = () => { brokenUrls.add(item.url); errCount++; setTimeout(showNext, 200); };
+      img.src = item.url;
+      layer.appendChild(img);
+    }
   }
 
   function showNext() {
@@ -538,7 +767,7 @@
     ov.innerHTML = '<div id="ff-layer-a" class="ff-layer active"></div><div id="ff-layer-b" class="ff-layer"></div>';
     const ctrl = document.createElement('div');
     ctrl.id = 'frameflow-controls';
-    ctrl.innerHTML = '<button id="ff-prev" title="Previous">&#9664;</button><button id="ff-playpause" title="Pause">&#10074;&#10074;</button><button id="ff-next" title="Next">&#9654;</button><button id="ff-hide-current" title="Hide this photo">&#128683;</button><button id="ff-settings-btn" title="Settings">&#9881;</button><button id="ff-exit" title="Exit">&#10005;</button>';
+    ctrl.innerHTML = '<button id="ff-prev" title="Previous">&#9664;</button><button id="ff-playpause" title="Pause">&#10074;&#10074;</button><button id="ff-next" title="Next">&#9654;</button><button id="ff-mute" title="Mute/Unmute">&#128264;</button><button id="ff-hide-current" title="Hide this photo">&#128683;</button><button id="ff-settings-btn" title="Settings">&#9881;</button><button id="ff-exit" title="Exit">&#10005;</button>';
     const sp = document.createElement('div');
     sp.id = 'ff-settings-panel';
     sp.innerHTML = `
@@ -568,6 +797,21 @@
     document.getElementById('ff-next').addEventListener('click', e => { e.stopPropagation(); showNext(); });
     document.getElementById('ff-playpause').addEventListener('click', e => { e.stopPropagation(); togglePause(); });
     document.getElementById('ff-exit').addEventListener('click', e => { e.stopPropagation(); stopSlideshow(); });
+
+    // Mute/unmute
+    document.getElementById('ff-mute').addEventListener('click', e => {
+      e.stopPropagation();
+      isMuted = !isMuted;
+      const btn = document.getElementById('ff-mute');
+      btn.innerHTML = isMuted ? '&#128263;' : '&#128264;';
+      btn.title = isMuted ? 'Unmute' : 'Mute';
+      // Update any currently playing video
+      const activeLayer = getActive();
+      if (activeLayer) {
+        const vid = activeLayer.querySelector('video');
+        if (vid) vid.muted = isMuted;
+      }
+    });
 
     // Hide current photo
     document.getElementById('ff-hide-current').addEventListener('click', e => {
@@ -697,7 +941,7 @@
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'PING') {
       // Report iframe photo count if we haven't captured yet, otherwise captured count
-      const count = collectedUrls.size > 0 ? collectedUrls.size : iframePhotoPositions.length;
+      const count = collectedMedia.length > 0 ? collectedMedia.length : iframePhotoPositions.length;
       sendResponse({ ok: true, running: isRunning, photoCount: count });
     } else if (msg.type === 'START_SLIDESHOW') {
       const count = startSlideshow(msg.settings);
