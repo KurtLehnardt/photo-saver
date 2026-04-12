@@ -353,6 +353,20 @@
     }
   });
 
+  // Keyboard controls
+  document.addEventListener('keydown', function(e) {
+    if (!sourcePicker.classList.contains('hidden')) return; // ignore on picker screen
+    if (e.key === 'ArrowRight' || e.key === ' ') {
+      e.preventDefault();
+      showNext();
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      showPrev();
+    } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault();
+    }
+  });
+
   // Hide button
   document.getElementById('btn-hide').addEventListener('click', function(e) {
     e.stopPropagation();
