@@ -9,7 +9,6 @@
 
   // ===== State =====
   const collectedUrls = new Set();
-  const seenBlobUrls = new Set();
   const brokenUrls = new Set();
   let photoUrls = [];
   let isRunning = false, isPaused = false, isScrolling = false;
@@ -54,27 +53,8 @@
     chrome.storage.local.set({ frameflow_settings: settings });
   }
 
-  // ===== Canvas capture =====
-  const captureCanvas = document.createElement('canvas');
-  const captureCtx = captureCanvas.getContext('2d');
-
-  function captureImage(img, maxDim) {
-    try {
-      const w = img.naturalWidth, h = img.naturalHeight;
-      if (w < 50 || h < 50) return null;
-      const cap = maxDim || 4096;
-      let dw = w, dh = h;
-      if (w > cap || h > cap) {
-        const s = cap / Math.max(w, h);
-        dw = Math.round(w * s); dh = Math.round(h * s);
-      }
-      captureCanvas.width = dw; captureCanvas.height = dh;
-      captureCtx.drawImage(img, 0, 0, dw, dh);
-      return new Promise(resolve => {
-        captureCanvas.toBlob(b => resolve(b ? URL.createObjectURL(b) : null), 'image/jpeg', 0.95);
-      });
-    } catch (e) { return null; }
-  }
+  // Canvas capture removed — iCloud's blob images are cross-origin and taint the canvas.
+  // Hi-res mode uses chrome.tabs.captureVisibleTab() screenshots instead.
 
   // ===== Scraping (thumbnails) =====
   const EXCLUDE = [/\.svg/i, /sprite/i, /favicon/i, /emoji/i, /apple-touch-icon/i];
@@ -94,14 +74,10 @@
     for (const doc of docs) {
       for (const img of doc.querySelectorAll('img')) {
         const src = img.src || '';
-        if (src.startsWith('blob:')) {
-          if (seenBlobUrls.has(src) || !img.complete || img.naturalWidth < 50 || img.naturalHeight < 50) continue;
-          seenBlobUrls.add(src);
-          try { const c = await captureImage(img, 2048); if (c) collectedUrls.add(c); } catch (e) {}
-        } else {
-          if (isExcluded(src) || (img.naturalWidth > 0 && img.naturalWidth < 50)) continue;
-          collectedUrls.add(src);
-        }
+        // Skip blob URLs — they're cross-origin on iCloud and will taint the canvas
+        if (src.startsWith('blob:')) continue;
+        if (isExcluded(src) || (img.naturalWidth > 0 && img.naturalWidth < 50)) continue;
+        collectedUrls.add(src);
       }
       doc.querySelectorAll('[style*="url"]').forEach(el => {
         const m = (el.getAttribute('style') || '').match(/url\(["']?([^"')]+)["']?\)/);
