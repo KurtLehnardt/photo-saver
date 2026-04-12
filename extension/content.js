@@ -24,91 +24,127 @@
   let shuffleIndex = 0;
   let activeLayer = 'a';
 
-  // iCloud CDN URL patterns for photos
-  const PHOTO_URL_PATTERNS = [
-    /cvws\.icloud-content\.com/,
-    /p\d+-.*\.icloud\.com/,
-    /is\d+-ssl\.mzstatic\.com/,
-    /\/photos\//
+  // Exclude patterns — UI elements, icons, etc.
+  const EXCLUDE_PATTERNS = [
+    /\.svg(\?|$)/i,
+    /sprite/i,
+    /\/icon/i,
+    /favicon/i,
+    /apple-touch-icon/i,
+    /emoji/i,
+    /avatar/i
   ];
 
+  const MIN_PHOTO_SIZE = 40; // pixels — skip images smaller than this
+
   // ===== Photo Scraping =====
-  function isPhotoUrl(url) {
-    if (!url || url.startsWith('data:') || url.startsWith('blob:')) return false;
-    // Accept any substantial image URL on the page
-    // Filter out tiny icons/UI elements by checking URL patterns and size hints
-    if (url.includes('icon') || url.includes('sprite') || url.includes('logo')) return false;
-    if (url.includes('.svg')) return false;
-    // Check for iCloud CDN patterns
-    for (const pattern of PHOTO_URL_PATTERNS) {
+  function isExcluded(url) {
+    if (!url) return true;
+    if (url.startsWith('data:') || url === '' || url === 'about:blank') return true;
+    for (const pattern of EXCLUDE_PATTERNS) {
       if (pattern.test(url)) return true;
     }
-    // Also accept any image URL that looks like a photo (has dimensions or token params)
-    if (url.includes('token') || url.includes('width') || url.includes('height')) return true;
     return false;
   }
 
-  function upgradeUrl(url) {
-    // Try to get a higher resolution version by modifying URL parameters
-    // iCloud URLs often have dimension parameters we can adjust
-    try {
-      const u = new URL(url);
-      // Common iCloud photo URL dimension patterns
-      if (u.searchParams.has('width')) {
-        u.searchParams.set('width', '2048');
-      }
-      if (u.searchParams.has('height')) {
-        u.searchParams.set('height', '2048');
-      }
-      return u.toString();
-    } catch (e) {
-      return url;
-    }
+  function extractUrl(str) {
+    // Extract URL from background-image value like url("...")
+    if (!str || str === 'none') return null;
+    const match = str.match(/url\(["']?([^"')]+)["']?\)/);
+    return match ? match[1] : null;
   }
 
   function scrapePhotos() {
     const urls = new Set();
 
-    // Strategy 1: Find all img elements with photo-like src
-    document.querySelectorAll('img').forEach(img => {
-      const src = img.src || img.getAttribute('src');
-      if (src && isPhotoUrl(src)) {
-        // Skip tiny thumbnails (likely UI icons)
-        if (img.naturalWidth > 0 && img.naturalWidth < 20) return;
-        urls.add(upgradeUrl(src));
-      }
-      // Also check srcset
-      const srcset = img.getAttribute('srcset');
-      if (srcset) {
-        srcset.split(',').forEach(entry => {
-          const parts = entry.trim().split(/\s+/);
-          if (parts[0] && isPhotoUrl(parts[0])) {
-            urls.add(upgradeUrl(parts[0]));
+    // Scrape ALL frames (iCloud loads content in iframes)
+    const documents = [document];
+    try {
+      const iframes = document.querySelectorAll('iframe');
+      iframes.forEach(iframe => {
+        try {
+          if (iframe.contentDocument) {
+            documents.push(iframe.contentDocument);
           }
-        });
-      }
-    });
+        } catch (e) { /* cross-origin, skip */ }
+      });
+    } catch (e) {}
 
-    // Strategy 2: Check background-image CSS on divs (some photo grids use this)
-    document.querySelectorAll('[style*="background-image"]').forEach(el => {
-      const style = el.getAttribute('style') || '';
-      const match = style.match(/background-image:\s*url\(["']?([^"')]+)["']?\)/);
-      if (match && match[1] && isPhotoUrl(match[1])) {
-        urls.add(upgradeUrl(match[1]));
-      }
-    });
+    for (const doc of documents) {
+      // Strategy 1: All <img> elements
+      doc.querySelectorAll('img').forEach(img => {
+        const src = img.src || img.getAttribute('src') || '';
+        if (isExcluded(src)) return;
+        // Skip tiny images (UI icons)
+        if (img.naturalWidth > 0 && img.naturalWidth < MIN_PHOTO_SIZE) return;
+        if (img.naturalHeight > 0 && img.naturalHeight < MIN_PHOTO_SIZE) return;
+        // Skip if rendered very small and has no natural size yet
+        if (img.width > 0 && img.width < MIN_PHOTO_SIZE && img.height > 0 && img.height < MIN_PHOTO_SIZE) return;
+        urls.add(src);
+      });
 
-    // Strategy 3: Check CSS computed background-image
-    document.querySelectorAll('[class*="photo"], [class*="thumb"], [class*="image"], [class*="asset"]').forEach(el => {
-      const computed = window.getComputedStyle(el);
-      const bg = computed.backgroundImage;
-      if (bg && bg !== 'none') {
-        const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
-        if (match && match[1] && isPhotoUrl(match[1])) {
-          urls.add(upgradeUrl(match[1]));
+      // Strategy 2: All inline background-image styles
+      doc.querySelectorAll('[style*="background"]').forEach(el => {
+        const style = el.getAttribute('style') || '';
+        const url = extractUrl(style);
+        if (url && !isExcluded(url)) {
+          // Check element size — skip tiny UI elements
+          const rect = el.getBoundingClientRect();
+          if (rect.width >= MIN_PHOTO_SIZE && rect.height >= MIN_PHOTO_SIZE) {
+            urls.add(url);
+          }
         }
-      }
-    });
+      });
+
+      // Strategy 3: Computed background-image on ALL elements with substantial size
+      // (expensive but thorough — iCloud may use CSS classes instead of inline styles)
+      doc.querySelectorAll('div, span, figure, section, article, li, a').forEach(el => {
+        const rect = el.getBoundingClientRect();
+        // Only check elements that are visible and photo-sized
+        if (rect.width < MIN_PHOTO_SIZE || rect.height < MIN_PHOTO_SIZE) return;
+        if (rect.width > 5000) return; // skip full-page containers
+        try {
+          const bg = window.getComputedStyle(el).backgroundImage;
+          const url = extractUrl(bg);
+          if (url && !isExcluded(url)) {
+            urls.add(url);
+          }
+        } catch (e) {}
+      });
+
+      // Strategy 4: <video> and <source> elements (iCloud may have Live Photos)
+      doc.querySelectorAll('video source, video[src]').forEach(el => {
+        const src = el.src || el.getAttribute('src') || '';
+        if (src && !isExcluded(src)) {
+          urls.add(src);
+        }
+      });
+
+      // Strategy 5: Canvas elements — check if they have a data URL we can grab
+      // (some photo apps render to canvas)
+      doc.querySelectorAll('canvas').forEach(canvas => {
+        if (canvas.width >= MIN_PHOTO_SIZE && canvas.height >= MIN_PHOTO_SIZE) {
+          try {
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+            if (dataUrl && dataUrl.length > 1000) { // skip blank canvases
+              urls.add(dataUrl);
+            }
+          } catch (e) { /* tainted canvas, skip */ }
+        }
+      });
+    }
+
+    // Log what we found for debugging
+    console.log('[FrameFlow] Scraped ' + urls.size + ' photos from ' + documents.length + ' document(s)');
+    if (urls.size === 0) {
+      // Debug: log what IS on the page
+      console.log('[FrameFlow] Debug — img elements found:', document.querySelectorAll('img').length);
+      console.log('[FrameFlow] Debug — iframes found:', document.querySelectorAll('iframe').length);
+      const allImgs = document.querySelectorAll('img');
+      allImgs.forEach((img, i) => {
+        if (i < 10) console.log('[FrameFlow] img[' + i + ']:', img.src, 'size:', img.naturalWidth + 'x' + img.naturalHeight);
+      });
+    }
 
     return Array.from(urls);
   }
