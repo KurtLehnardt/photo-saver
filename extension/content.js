@@ -1,304 +1,199 @@
 // FrameFlow Content Script for icloud.com/photos
-// Runs in ALL frames. The iframe instance scrolls & scrapes.
-// The top-level instance renders the slideshow overlay.
-// They communicate via chrome.runtime messages.
+// Single-script approach: scrape all visible images, scroll to load more.
 
 (function() {
   'use strict';
 
-  const isTopFrame = (window === window.top);
-  console.log('[FrameFlow] Loaded in', isTopFrame ? 'TOP FRAME' : 'IFRAME', window.location.href.substring(0, 80));
+  console.log('[FrameFlow] Content script loaded on', window.location.href);
 
-  // ===== SHARED: Photo scraping =====
+  // Only run in the top frame
+  if (window !== window.top) {
+    console.log('[FrameFlow] Skipping iframe instance');
+    return;
+  }
+
+  // ===== State =====
   const collectedUrls = new Set();
   const seenBlobUrls = new Set();
   const brokenUrls = new Set();
-  const MIN_PHOTO_SIZE = 50;
+  let photoUrls = [];
+  let isRunning = false;
+  let isPaused = false;
+  let isScrolling = false;
+  let settings = {
+    shuffle: true, transition: 'fade', fill: 'contain',
+    kenBurns: true, duration: 8, targetPhotos: 500
+  };
+  let slideTimer = null, controlsTimer = null, scrollTimer = null;
+  let currentIndex = -1, shuffledOrder = [], shuffleIndex = 0;
+  let activeLayer = 'a';
 
-  const EXCLUDE_PATTERNS = [
-    /\.svg(\?|$)/i, /sprite/i, /favicon/i, /apple-touch-icon/i,
-    /emoji/i, /\/ui\//i, /\/assets\//i
-  ];
-
-  function isExcluded(url) {
-    if (!url || url === '' || url === 'about:blank') return true;
-    if (url.startsWith('data:')) return true;
-    if (url.length < 30) return true;
-    for (const p of EXCLUDE_PATTERNS) { if (p.test(url)) return true; }
-    return false;
+  function saveExtSettings() {
+    chrome.storage.local.set({ frameflow_settings: settings });
   }
 
+  // ===== Canvas capture for blob URLs =====
   const captureCanvas = document.createElement('canvas');
   const captureCtx = captureCanvas.getContext('2d');
 
   function captureImage(img) {
     try {
       const w = img.naturalWidth, h = img.naturalHeight;
-      if (w < MIN_PHOTO_SIZE || h < MIN_PHOTO_SIZE) return null;
+      if (w < 50 || h < 50) return null;
       const maxDim = 2048;
       let dw = w, dh = h;
       if (w > maxDim || h > maxDim) {
         const scale = maxDim / Math.max(w, h);
-        dw = Math.round(w * scale);
-        dh = Math.round(h * scale);
+        dw = Math.round(w * scale); dh = Math.round(h * scale);
       }
       captureCanvas.width = dw;
       captureCanvas.height = dh;
       captureCtx.drawImage(img, 0, 0, dw, dh);
       return new Promise(resolve => {
-        captureCanvas.toBlob(blob => {
-          resolve(blob ? URL.createObjectURL(blob) : null);
-        }, 'image/jpeg', 0.92);
+        captureCanvas.toBlob(blob => resolve(blob ? URL.createObjectURL(blob) : null), 'image/jpeg', 0.95);
       });
     } catch (e) { return null; }
   }
 
-  async function scrapeCurrentDoc() {
-    const before = collectedUrls.size;
+  // ===== Scraping =====
+  const EXCLUDE = [/\.svg/i, /sprite/i, /favicon/i, /emoji/i, /apple-touch-icon/i];
 
-    // All img elements in THIS document
-    const imgs = document.querySelectorAll('img');
-    for (const img of imgs) {
-      const src = img.src || '';
-      if (src.startsWith('blob:')) {
-        if (seenBlobUrls.has(src)) continue;
-        if (!img.complete || img.naturalWidth < MIN_PHOTO_SIZE || img.naturalHeight < MIN_PHOTO_SIZE) continue;
-        seenBlobUrls.add(src);
-        try {
-          const captured = await captureImage(img);
-          if (captured) collectedUrls.add(captured);
-        } catch (e) {}
-        continue;
-      }
-      if (isExcluded(src)) continue;
-      if (img.naturalWidth > 0 && img.naturalWidth < MIN_PHOTO_SIZE) continue;
-      if (img.naturalHeight > 0 && img.naturalHeight < MIN_PHOTO_SIZE) continue;
-      collectedUrls.add(src);
-    }
-
-    // Background images
-    document.querySelectorAll('[style*="background"]').forEach(el => {
-      const style = el.getAttribute('style') || '';
-      const match = style.match(/url\(["']?([^"')]+)["']?\)/);
-      if (match && match[1] && !isExcluded(match[1]) && !match[1].startsWith('blob:')) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width >= MIN_PHOTO_SIZE && rect.height >= MIN_PHOTO_SIZE) {
-          collectedUrls.add(match[1]);
-        }
-      }
-    });
-
-    return collectedUrls.size - before;
+  function isExcluded(url) {
+    if (!url || url.length < 20 || url.startsWith('data:')) return true;
+    for (const p of EXCLUDE) { if (p.test(url)) return true; }
+    return false;
   }
 
-  // =============================================
-  // IFRAME INSTANCE: Scrolling + scraping
-  // =============================================
-  if (!isTopFrame) {
+  async function scrapeAll() {
+    const before = collectedUrls.size;
 
-    let isScrolling = false;
-    let scrollInterval = null;
+    // Scrape ALL img elements in ALL accessible documents
+    const docs = [document];
+    document.querySelectorAll('iframe').forEach(iframe => {
+      try { if (iframe.contentDocument) docs.push(iframe.contentDocument); } catch (e) {}
+    });
 
-    function findScrollContainer() {
-      let best = null, bestScore = 0;
-      document.querySelectorAll('*').forEach(el => {
+    for (const doc of docs) {
+      const imgs = doc.querySelectorAll('img');
+      for (const img of imgs) {
+        const src = img.src || '';
+
+        // Blob URL — capture via canvas
+        if (src.startsWith('blob:')) {
+          if (seenBlobUrls.has(src)) continue;
+          if (!img.complete || img.naturalWidth < 50 || img.naturalHeight < 50) continue;
+          seenBlobUrls.add(src);
+          try {
+            const captured = await captureImage(img);
+            if (captured) collectedUrls.add(captured);
+          } catch (e) {}
+          continue;
+        }
+
+        // Regular URL
+        if (isExcluded(src)) continue;
+        if (img.naturalWidth > 0 && img.naturalWidth < 50) continue;
+        collectedUrls.add(src);
+      }
+
+      // Background images
+      doc.querySelectorAll('[style*="url"]').forEach(el => {
+        const match = (el.getAttribute('style') || '').match(/url\(["']?([^"')]+)["']?\)/);
+        if (match && match[1] && !isExcluded(match[1]) && !match[1].startsWith('blob:')) {
+          const r = el.getBoundingClientRect();
+          if (r.width >= 50 && r.height >= 50) collectedUrls.add(match[1]);
+        }
+      });
+    }
+
+    const added = collectedUrls.size - before;
+    if (added > 0) {
+      photoUrls = Array.from(collectedUrls);
+      console.log('[FrameFlow] +' + added + ' photos (total: ' + photoUrls.length + ')');
+    }
+    return added;
+  }
+
+  // ===== Auto-scroll =====
+  function findScrollContainer() {
+    let best = null, bestScore = 0;
+
+    // Check top document
+    document.querySelectorAll('*').forEach(el => {
+      try {
         const s = window.getComputedStyle(el);
         if (s.overflowY === 'scroll' || s.overflowY === 'auto') {
           const score = el.scrollHeight - el.clientHeight;
-          if (score > bestScore + 100) { bestScore = score; best = el; }
+          if (score > bestScore) { bestScore = score; best = el; }
         }
-      });
-      console.log('[FrameFlow/iframe] Scroll container:', best ? best.tagName + ' scrollHeight=' + best.scrollHeight : 'none');
-      return best;
-    }
-
-    // Send photo data up to top frame
-    function sendPhotosToTop() {
-      const urls = Array.from(collectedUrls);
-      window.top.postMessage({ type: 'FRAMEFLOW_PHOTOS', urls: urls }, '*');
-    }
-
-    // Debounced scraper
-    let scrapeTimer = null;
-    let isCollecting = false;
-    async function debouncedScrape() {
-      if (isCollecting) return;
-      isCollecting = true;
-      const added = await scrapeCurrentDoc();
-      if (added > 0) sendPhotosToTop();
-      isCollecting = false;
-    }
-
-    // MutationObserver
-    const observer = new MutationObserver(() => {
-      clearTimeout(scrapeTimer);
-      scrapeTimer = setTimeout(debouncedScrape, 500);
-    });
-    if (document.body) {
-      observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'style'] });
-    }
-
-    // Periodic scrape
-    setInterval(debouncedScrape, 2000);
-
-    // Initial scrape
-    scrapeCurrentDoc().then(() => {
-      console.log('[FrameFlow/iframe] Initial scrape:', collectedUrls.size, 'photos');
-      sendPhotosToTop();
+      } catch (e) {}
     });
 
-    // Listen for scroll commands from top frame
-    window.addEventListener('message', async (e) => {
-      if (!e.data || e.data.type !== 'FRAMEFLOW_SCROLL') return;
-
-      const target = e.data.targetCount || 500;
-      const container = findScrollContainer();
-
-      if (!container) {
-        console.log('[FrameFlow/iframe] No scroll container found');
-        window.top.postMessage({ type: 'FRAMEFLOW_SCROLL_DONE', count: collectedUrls.size }, '*');
-        return;
-      }
-
-      console.log('[FrameFlow/iframe] Starting scroll. Target:', target, 'Container scrollHeight:', container.scrollHeight);
-
-      isScrolling = true;
-      let staleRounds = 0;
-      const maxStale = 25;
-      let lastCount = collectedUrls.size;
-
-      async function tick() {
-        if (!isScrolling) return;
-        if (target > 0 && collectedUrls.size >= target) {
-          console.log('[FrameFlow/iframe] Reached target:', collectedUrls.size);
-          finish();
-          return;
-        }
-
-        // Scroll DOWN (iCloud shows newest at top, oldest at bottom)
-        const beforeScroll = container.scrollTop;
-        container.scrollTop += container.clientHeight;
-
-        // Wait for render
-        await new Promise(r => setTimeout(r, 1200));
-        await scrapeCurrentDoc();
-
-        const newCount = collectedUrls.size;
-        if (newCount > lastCount) {
-          staleRounds = 0;
-          sendPhotosToTop();
-          window.top.postMessage({
-            type: 'FRAMEFLOW_SCROLL_PROGRESS',
-            count: newCount,
-            target: target
-          }, '*');
-        } else {
-          staleRounds++;
-        }
-        lastCount = newCount;
-
-        // Check if we're stuck (scrolled but nothing new)
-        const didScroll = container.scrollTop !== beforeScroll;
-        if (!didScroll) staleRounds += 5; // fast-forward if can't scroll further
-
-        if (staleRounds >= maxStale) {
-          console.log('[FrameFlow/iframe] Scroll complete. Found:', collectedUrls.size);
-          finish();
-          return;
-        }
-
-        setTimeout(tick, 300);
-      }
-
-      function finish() {
-        isScrolling = false;
-        sendPhotosToTop();
-        window.top.postMessage({ type: 'FRAMEFLOW_SCROLL_DONE', count: collectedUrls.size }, '*');
-        // Scroll back to top
-        container.scrollTop = 0;
-      }
-
-      tick();
+    // Check iframes
+    document.querySelectorAll('iframe').forEach(iframe => {
+      try {
+        if (!iframe.contentDocument) return;
+        iframe.contentDocument.querySelectorAll('*').forEach(el => {
+          try {
+            const s = iframe.contentWindow.getComputedStyle(el);
+            if (s.overflowY === 'scroll' || s.overflowY === 'auto') {
+              const score = el.scrollHeight - el.clientHeight;
+              if (score > bestScore) { bestScore = score; best = el; }
+            }
+          } catch (e) {}
+        });
+      } catch (e) {}
     });
 
-    // Listen for stop
-    window.addEventListener('message', (e) => {
-      if (e.data && e.data.type === 'FRAMEFLOW_STOP_SCROLL') {
-        isScrolling = false;
-      }
-    });
-
-    return; // iframe instance ends here
+    console.log('[FrameFlow] Scroll container:', best
+      ? best.tagName + ' class=' + (best.className || '').substring(0, 40) + ' scrollH=' + best.scrollHeight
+      : 'document.documentElement');
+    return best || document.documentElement;
   }
 
-  // =============================================
-  // TOP FRAME INSTANCE: Overlay + slideshow
-  // =============================================
-  let photoUrls = [];
-  let isRunning = false;
-  let settings = {
-    shuffle: true, transition: 'fade', fill: 'contain',
-    kenBurns: true, duration: 8, targetPhotos: 500
-  };
+  async function autoScroll(target, onProgress, onDone) {
+    const container = findScrollContainer();
+    let staleRounds = 0, lastCount = collectedUrls.size;
+    isScrolling = true;
 
-  let slideTimer = null, controlsTimer = null;
-  let scrollInterval = null;
-  let currentIndex = -1, shuffledOrder = [], shuffleIndex = 0;
-  let activeLayer = 'a', isPaused = false;
+    console.log('[FrameFlow] Scrolling to load ~' + target + ' photos');
 
-  function saveExtSettings() {
-    chrome.storage.local.set({ frameflow_settings: settings });
-  }
-
-  // Receive photos from iframe
-  window.addEventListener('message', (e) => {
-    if (!e.data) return;
-
-    if (e.data.type === 'FRAMEFLOW_PHOTOS') {
-      const before = collectedUrls.size;
-      e.data.urls.forEach(u => collectedUrls.add(u));
-      if (collectedUrls.size > before) {
-        photoUrls = Array.from(collectedUrls);
-        console.log('[FrameFlow/top] Received photos from iframe. Total:', photoUrls.length);
+    async function tick() {
+      if (!isScrolling || !isRunning) { onDone(); return; }
+      if (target > 0 && collectedUrls.size >= target) {
+        console.log('[FrameFlow] Target reached:', collectedUrls.size);
+        isScrolling = false; onDone(); return;
       }
+
+      // Scroll down
+      const before = container.scrollTop;
+      container.scrollTop += container.clientHeight;
+      // Also scroll window and body
+      window.scrollBy(0, window.innerHeight);
+      document.body.scrollTop += window.innerHeight;
+
+      await new Promise(r => setTimeout(r, 1000));
+      await scrapeAll();
+
+      if (collectedUrls.size > lastCount) {
+        staleRounds = 0;
+        onProgress(collectedUrls.size);
+      } else {
+        staleRounds++;
+        // If scroll didn't move, we're at the end
+        if (container.scrollTop === before) staleRounds += 10;
+      }
+      lastCount = collectedUrls.size;
+
+      if (staleRounds >= 20) {
+        console.log('[FrameFlow] Scroll done. Total:', collectedUrls.size);
+        isScrolling = false; onDone(); return;
+      }
+
+      scrollTimer = setTimeout(tick, 500);
     }
 
-    if (e.data.type === 'FRAMEFLOW_SCROLL_PROGRESS') {
-      const countEl = document.getElementById('ff-photo-count');
-      if (countEl) countEl.textContent = e.data.count;
-      photoUrls = Array.from(collectedUrls);
-
-      // Start slideshow as soon as we have some photos
-      if (isRunning && currentIndex < 0 && photoUrls.length > 0) {
-        buildShuffleOrder();
-        const loader = document.getElementById('frameflow-loader');
-        if (loader) loader.style.display = 'none';
-        showNext();
-      }
-
-      // Extend shuffle
-      if (settings.shuffle) {
-        for (let i = shuffledOrder.length; i < photoUrls.length; i++) {
-          shuffledOrder.splice(Math.floor(Math.random() * (shuffledOrder.length + 1)), 0, i);
-        }
-      }
-    }
-
-    if (e.data.type === 'FRAMEFLOW_SCROLL_DONE') {
-      photoUrls = Array.from(collectedUrls);
-      showStatus(photoUrls.length + ' photos loaded');
-      const loader = document.getElementById('frameflow-loader');
-      if (loader) loader.style.display = 'none';
-      if (photoUrls.length === 0) {
-        showStatus('No photos found. Make sure iCloud Photos is loaded.');
-      }
-    }
-  });
-
-  // Also scrape top frame (in case photos aren't in iframe)
-  async function scrapeTop() {
-    await scrapeCurrentDoc();
-    photoUrls = Array.from(collectedUrls);
+    tick();
   }
 
   // ===== Shuffle =====
@@ -306,88 +201,84 @@
     shuffledOrder = photoUrls.map((_, i) => i);
     for (let i = shuffledOrder.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
-      const tmp = shuffledOrder[i]; shuffledOrder[i] = shuffledOrder[j]; shuffledOrder[j] = tmp;
+      const t = shuffledOrder[i]; shuffledOrder[i] = shuffledOrder[j]; shuffledOrder[j] = t;
     }
     shuffleIndex = 0;
   }
-
   function getNextIndex() {
-    if (photoUrls.length === 0) return -1;
+    if (!photoUrls.length) return -1;
     if (settings.shuffle) {
       if (shuffleIndex >= shuffledOrder.length) buildShuffleOrder();
       return shuffledOrder[shuffleIndex++];
     }
     return (currentIndex + 1) % photoUrls.length;
   }
-
   function getPrevIndex() {
-    if (photoUrls.length === 0) return -1;
+    if (!photoUrls.length) return -1;
     return currentIndex <= 0 ? photoUrls.length - 1 : currentIndex - 1;
   }
 
   // ===== Ken Burns =====
-  const KB_CLASSES = ['ff-kb-1', 'ff-kb-2', 'ff-kb-3', 'ff-kb-4'];
+  const KB = ['ff-kb-1', 'ff-kb-2', 'ff-kb-3', 'ff-kb-4'];
   function applyKenBurns(layer) {
-    KB_CLASSES.forEach(c => layer.classList.remove(c));
+    KB.forEach(c => layer.classList.remove(c));
     layer.classList.remove('ff-kenburns');
-    if (settings.kenBurns) {
-      layer.classList.add('ff-kenburns', KB_CLASSES[Math.floor(Math.random() * KB_CLASSES.length)]);
-    }
+    if (settings.kenBurns) layer.classList.add('ff-kenburns', KB[Math.floor(Math.random() * KB.length)]);
   }
 
-  // ===== Slideshow Engine =====
-  function getInactiveLayer() { return document.getElementById(activeLayer === 'a' ? 'ff-layer-b' : 'ff-layer-a'); }
-  function getActiveLayerEl() { return document.getElementById(activeLayer === 'a' ? 'ff-layer-a' : 'ff-layer-b'); }
+  // ===== Slideshow =====
+  function getInactive() { return document.getElementById(activeLayer === 'a' ? 'ff-layer-b' : 'ff-layer-a'); }
+  function getActive() { return document.getElementById(activeLayer === 'a' ? 'ff-layer-a' : 'ff-layer-b'); }
 
-  function clearLayer(layer) {
-    if (!layer) return;
-    KB_CLASSES.forEach(c => layer.classList.remove(c));
-    layer.classList.remove('ff-kenburns', 'slide-enter', 'slide-exit', 'no-transition', 'ff-fill-cover');
-    layer.innerHTML = '';
+  function clearLayer(l) {
+    if (!l) return;
+    KB.forEach(c => l.classList.remove(c));
+    l.classList.remove('ff-kenburns', 'slide-enter', 'slide-exit', 'no-transition', 'ff-fill-cover');
+    l.innerHTML = '';
   }
 
   function swapLayers() {
-    const incoming = getInactiveLayer(), outgoing = getActiveLayerEl();
-    if (!incoming || !outgoing) return;
+    const inc = getInactive(), out = getActive();
+    if (!inc || !out) return;
     if (settings.transition === 'fade') {
-      incoming.classList.add('active'); outgoing.classList.remove('active');
+      inc.classList.add('active'); out.classList.remove('active');
     } else if (settings.transition === 'slide') {
-      incoming.classList.remove('slide-enter', 'slide-exit');
-      outgoing.classList.remove('slide-enter', 'slide-exit');
-      void incoming.offsetWidth;
-      incoming.classList.add('slide-enter'); void incoming.offsetWidth;
-      incoming.classList.add('active');
-      outgoing.classList.add('slide-exit'); outgoing.classList.remove('active');
+      inc.classList.remove('slide-enter', 'slide-exit');
+      out.classList.remove('slide-enter', 'slide-exit');
+      void inc.offsetWidth;
+      inc.classList.add('slide-enter'); void inc.offsetWidth;
+      inc.classList.add('active');
+      out.classList.add('slide-exit'); out.classList.remove('active');
     } else {
-      incoming.classList.add('no-transition', 'active'); outgoing.classList.remove('active');
-      setTimeout(() => incoming.classList.remove('no-transition'), 50);
+      inc.classList.add('no-transition', 'active'); out.classList.remove('active');
+      setTimeout(() => inc.classList.remove('no-transition'), 50);
     }
     activeLayer = activeLayer === 'a' ? 'b' : 'a';
   }
 
-  let errorCount = 0;
-  function loadSlide(index) {
-    if (index < 0 || index >= photoUrls.length) return;
-    if (errorCount >= 10) { showStatus('Many photos failed to load.'); errorCount = 0; return; }
-    const url = photoUrls[index];
-    if (brokenUrls.has(url)) { errorCount++; setTimeout(showNext, 50); return; }
+  let errCount = 0;
+  function loadSlide(idx) {
+    if (idx < 0 || idx >= photoUrls.length) return;
+    if (errCount >= 10) { showStatus('Many photos failed to load.'); errCount = 0; return; }
+    const url = photoUrls[idx];
+    if (brokenUrls.has(url)) { errCount++; setTimeout(showNext, 50); return; }
 
-    const layer = getInactiveLayer();
+    const layer = getInactive();
     if (!layer) return;
     clearLayer(layer);
-    currentIndex = index;
+    currentIndex = idx;
     if (settings.fill === 'cover') layer.classList.add('ff-fill-cover');
 
     const img = document.createElement('img');
-    img.onload = () => { errorCount = 0; applyKenBurns(layer); swapLayers(); scheduleNext(); };
-    img.onerror = () => { brokenUrls.add(url); errorCount++; setTimeout(showNext, 200); };
+    img.onload = () => { errCount = 0; applyKenBurns(layer); swapLayers(); scheduleNext(); };
+    img.onerror = () => { brokenUrls.add(url); errCount++; setTimeout(showNext, 200); };
     img.src = url;
     layer.appendChild(img);
   }
 
-  function showNext() { clearTimeout(slideTimer); const idx = getNextIndex(); if (idx >= 0) loadSlide(idx); }
-  function showPrev() { clearTimeout(slideTimer); const idx = getPrevIndex(); if (idx >= 0) loadSlide(idx); }
-  function scheduleNext() { clearTimeout(slideTimer); if (!isPaused && photoUrls.length > 0) slideTimer = setTimeout(showNext, settings.duration * 1000); }
+  function showNext() { clearTimeout(slideTimer); const i = getNextIndex(); if (i >= 0) loadSlide(i); }
+  function showPrev() { clearTimeout(slideTimer); const i = getPrevIndex(); if (i >= 0) loadSlide(i); }
+  function scheduleNext() { clearTimeout(slideTimer); if (!isPaused && photoUrls.length) slideTimer = setTimeout(showNext, settings.duration * 1000); }
 
   // ===== Controls =====
   function toggleControls() {
@@ -397,21 +288,18 @@
     clearTimeout(controlsTimer);
     if (c.classList.contains('visible')) controlsTimer = setTimeout(() => c.classList.remove('visible'), 5000);
   }
-
   function togglePause() {
     isPaused = !isPaused;
-    const btn = document.getElementById('ff-playpause');
-    if (btn) { btn.innerHTML = isPaused ? '&#9654;' : '&#10074;&#10074;'; }
+    const b = document.getElementById('ff-playpause');
+    if (b) b.innerHTML = isPaused ? '&#9654;' : '&#10074;&#10074;';
     if (isPaused) clearTimeout(slideTimer); else scheduleNext();
   }
-
-  function showStatus(text) {
+  function showStatus(t) {
     const el = document.getElementById('frameflow-status');
     if (!el) return;
-    el.textContent = text; el.classList.add('visible');
+    el.textContent = t; el.classList.add('visible');
     setTimeout(() => el.classList.remove('visible'), 3000);
   }
-
   function handleKeydown(e) {
     if (!isRunning) return;
     if (e.key === 'Escape') { e.preventDefault(); stopSlideshow(); }
@@ -422,185 +310,80 @@
   // ===== Overlay =====
   function createOverlay() {
     removeOverlay();
+    const ov = document.createElement('div');
+    ov.id = 'frameflow-overlay';
+    ov.innerHTML = '<div id="ff-layer-a" class="ff-layer active"></div><div id="ff-layer-b" class="ff-layer"></div>';
 
-    const overlay = document.createElement('div');
-    overlay.id = 'frameflow-overlay';
-    overlay.innerHTML = '<div id="ff-layer-a" class="ff-layer active"></div><div id="ff-layer-b" class="ff-layer"></div>';
+    const ctrl = document.createElement('div');
+    ctrl.id = 'frameflow-controls';
+    ctrl.innerHTML = '<button id="ff-prev" title="Previous">&#9664;</button><button id="ff-playpause" title="Pause">&#10074;&#10074;</button><button id="ff-next" title="Next">&#9654;</button><button id="ff-settings-btn" title="Settings">&#9881;</button><button id="ff-exit" title="Exit">&#10005;</button>';
 
-    const controls = document.createElement('div');
-    controls.id = 'frameflow-controls';
-    controls.innerHTML = `
-      <button id="ff-prev" title="Previous">&#9664;</button>
-      <button id="ff-playpause" title="Pause">&#10074;&#10074;</button>
-      <button id="ff-next" title="Next">&#9654;</button>
-      <button id="ff-settings-btn" title="Settings">&#9881;</button>
-      <button id="ff-exit" title="Exit">&#10005;</button>
-    `;
-
-    const settingsPanel = document.createElement('div');
-    settingsPanel.id = 'ff-settings-panel';
-    settingsPanel.innerHTML = `
+    const sp = document.createElement('div');
+    sp.id = 'ff-settings-panel';
+    sp.innerHTML = `
       <div class="ff-settings-title">Settings</div>
       <div class="ff-setting"><span>Photo Fill</span>
-        <select id="ff-set-fill">
-          <option value="contain" ${settings.fill === 'contain' ? 'selected' : ''}>Fit (show full photo)</option>
-          <option value="cover" ${settings.fill === 'cover' ? 'selected' : ''}>Fill (crop to fill)</option>
-        </select>
+        <select id="ff-set-fill"><option value="contain"${settings.fill==='contain'?' selected':''}>Fit</option><option value="cover"${settings.fill==='cover'?' selected':''}>Fill (crop)</option></select>
       </div>
-      <div class="ff-setting"><span>Shuffle</span>
-        <input type="checkbox" id="ff-set-shuffle" ${settings.shuffle ? 'checked' : ''}>
-      </div>
+      <div class="ff-setting"><span>Shuffle</span><input type="checkbox" id="ff-set-shuffle"${settings.shuffle?' checked':''}></div>
       <div class="ff-setting"><span>Transition</span>
-        <select id="ff-set-transition">
-          <option value="fade" ${settings.transition === 'fade' ? 'selected' : ''}>Fade</option>
-          <option value="slide" ${settings.transition === 'slide' ? 'selected' : ''}>Slide</option>
-          <option value="none" ${settings.transition === 'none' ? 'selected' : ''}>None</option>
-        </select>
+        <select id="ff-set-transition"><option value="fade"${settings.transition==='fade'?' selected':''}>Fade</option><option value="slide"${settings.transition==='slide'?' selected':''}>Slide</option><option value="none"${settings.transition==='none'?' selected':''}>None</option></select>
       </div>
-      <div class="ff-setting"><span>Ken Burns</span>
-        <input type="checkbox" id="ff-set-kenburns" ${settings.kenBurns ? 'checked' : ''}>
-      </div>
-      <div class="ff-setting"><span>Duration</span>
-        <div class="ff-range-wrap">
-          <input type="range" id="ff-set-duration" min="3" max="30" value="${settings.duration}">
-          <span id="ff-duration-val">${settings.duration}s</span>
-        </div>
-      </div>
+      <div class="ff-setting"><span>Ken Burns</span><input type="checkbox" id="ff-set-kenburns"${settings.kenBurns?' checked':''}></div>
+      <div class="ff-setting"><span>Duration</span><div class="ff-range-wrap"><input type="range" id="ff-set-duration" min="3" max="30" value="${settings.duration}"><span id="ff-duration-val">${settings.duration}s</span></div></div>
     `;
 
-    const status = document.createElement('div');
-    status.id = 'frameflow-status';
+    const st = document.createElement('div'); st.id = 'frameflow-status';
+    const ld = document.createElement('div'); ld.id = 'frameflow-loader';
+    ld.innerHTML = '<div class="ff-count" id="ff-photo-count">0</div><div class="ff-label">photos found — scrolling to load more...</div>';
 
-    const loader = document.createElement('div');
-    loader.id = 'frameflow-loader';
-    loader.innerHTML = '<div class="ff-count" id="ff-photo-count">0</div><div class="ff-label">photos found — scrolling to load more...</div>';
+    document.body.appendChild(ov);
+    document.body.appendChild(ctrl);
+    document.body.appendChild(sp);
+    document.body.appendChild(st);
+    document.body.appendChild(ld);
 
-    document.body.appendChild(overlay);
-    document.body.appendChild(controls);
-    document.body.appendChild(settingsPanel);
-    document.body.appendChild(status);
-    document.body.appendChild(loader);
-
-    overlay.addEventListener('click', (e) => {
-      const sp = document.getElementById('ff-settings-panel');
-      if (sp && sp.classList.contains('visible')) { sp.classList.remove('visible'); return; }
+    ov.addEventListener('click', () => {
+      const panel = document.getElementById('ff-settings-panel');
+      if (panel && panel.classList.contains('visible')) { panel.classList.remove('visible'); return; }
       toggleControls();
     });
-    document.getElementById('ff-prev').addEventListener('click', (e) => { e.stopPropagation(); showPrev(); });
-    document.getElementById('ff-next').addEventListener('click', (e) => { e.stopPropagation(); showNext(); });
-    document.getElementById('ff-playpause').addEventListener('click', (e) => { e.stopPropagation(); togglePause(); });
-    document.getElementById('ff-exit').addEventListener('click', (e) => { e.stopPropagation(); stopSlideshow(); });
-    document.getElementById('ff-settings-btn').addEventListener('click', (e) => {
+    document.getElementById('ff-prev').addEventListener('click', e => { e.stopPropagation(); showPrev(); });
+    document.getElementById('ff-next').addEventListener('click', e => { e.stopPropagation(); showNext(); });
+    document.getElementById('ff-playpause').addEventListener('click', e => { e.stopPropagation(); togglePause(); });
+    document.getElementById('ff-exit').addEventListener('click', e => { e.stopPropagation(); stopSlideshow(); });
+    document.getElementById('ff-settings-btn').addEventListener('click', e => {
       e.stopPropagation();
       document.getElementById('ff-settings-panel').classList.toggle('visible');
     });
 
-    settingsPanel.addEventListener('click', (e) => { e.stopPropagation(); });
-    settingsPanel.addEventListener('mousedown', (e) => { e.stopPropagation(); });
+    // Stop clicks inside settings panel from propagating
+    sp.addEventListener('click', e => e.stopPropagation());
+    sp.addEventListener('mousedown', e => e.stopPropagation());
 
     // Settings handlers
-    document.getElementById('ff-set-fill').addEventListener('change', (e) => {
+    document.getElementById('ff-set-fill').addEventListener('change', e => {
       settings.fill = e.target.value;
-      const active = getActiveLayerEl();
-      if (active) { if (settings.fill === 'cover') active.classList.add('ff-fill-cover'); else active.classList.remove('ff-fill-cover'); }
+      const a = getActive(); if (a) { a.classList.toggle('ff-fill-cover', settings.fill === 'cover'); }
       saveExtSettings();
     });
-    document.getElementById('ff-set-shuffle').addEventListener('change', (e) => { settings.shuffle = e.target.checked; if (settings.shuffle) buildShuffleOrder(); saveExtSettings(); });
-    document.getElementById('ff-set-transition').addEventListener('change', (e) => { settings.transition = e.target.value; saveExtSettings(); });
-    document.getElementById('ff-set-kenburns').addEventListener('change', (e) => { settings.kenBurns = e.target.checked; saveExtSettings(); });
-    document.getElementById('ff-set-duration').addEventListener('input', (e) => {
+    document.getElementById('ff-set-shuffle').addEventListener('change', e => { settings.shuffle = e.target.checked; if (settings.shuffle) buildShuffleOrder(); saveExtSettings(); });
+    document.getElementById('ff-set-transition').addEventListener('change', e => { settings.transition = e.target.value; saveExtSettings(); });
+    document.getElementById('ff-set-kenburns').addEventListener('change', e => { settings.kenBurns = e.target.checked; saveExtSettings(); });
+    document.getElementById('ff-set-duration').addEventListener('input', e => {
       settings.duration = parseInt(e.target.value, 10);
       document.getElementById('ff-duration-val').textContent = settings.duration + 's';
     });
-    document.getElementById('ff-set-duration').addEventListener('change', (e) => {
-      settings.duration = parseInt(e.target.value, 10); saveExtSettings();
-    });
+    document.getElementById('ff-set-duration').addEventListener('change', e => { settings.duration = parseInt(e.target.value, 10); saveExtSettings(); });
 
     document.addEventListener('keydown', handleKeydown);
   }
 
   function removeOverlay() {
     ['frameflow-overlay', 'frameflow-controls', 'ff-settings-panel', 'frameflow-status', 'frameflow-loader'].forEach(id => {
-      const el = document.getElementById(id);
-      if (el) el.remove();
+      const el = document.getElementById(id); if (el) el.remove();
     });
     document.removeEventListener('keydown', handleKeydown);
-  }
-
-  // ===== Top-frame scroll fallback =====
-  let topScrollInterval = null;
-
-  async function topFrameScroll(targetCount) {
-    // Find scroll container in top frame
-    let best = null, bestScore = 0;
-    document.querySelectorAll('*').forEach(el => {
-      const s = window.getComputedStyle(el);
-      if (s.overflowY === 'scroll' || s.overflowY === 'auto') {
-        const score = el.scrollHeight - el.clientHeight;
-        if (score > bestScore + 100) { bestScore = score; best = el; }
-      }
-    });
-    const container = best || document.documentElement;
-    console.log('[FrameFlow/top] Scroll container:', container.tagName, 'scrollHeight:', container.scrollHeight);
-
-    let staleRounds = 0, lastCount = collectedUrls.size;
-
-    async function tick() {
-      if (!isRunning) return;
-      if (targetCount > 0 && collectedUrls.size >= targetCount) {
-        console.log('[FrameFlow/top] Reached target:', collectedUrls.size);
-        finishTopScroll();
-        return;
-      }
-
-      const beforeScroll = container.scrollTop;
-      container.scrollTop += container.clientHeight;
-      window.scrollBy(0, window.innerHeight);
-
-      await new Promise(r => setTimeout(r, 1200));
-      await scrapeCurrentDoc();
-
-      photoUrls = Array.from(collectedUrls);
-      const countEl = document.getElementById('ff-photo-count');
-      if (countEl) countEl.textContent = photoUrls.length;
-
-      if (collectedUrls.size > lastCount) {
-        staleRounds = 0;
-        // Start slideshow if not started
-        if (currentIndex < 0 && photoUrls.length > 0) {
-          buildShuffleOrder();
-          const loader = document.getElementById('frameflow-loader');
-          if (loader) loader.style.display = 'none';
-          showNext();
-        }
-        // Extend shuffle
-        if (settings.shuffle) {
-          for (let i = shuffledOrder.length; i < photoUrls.length; i++) {
-            shuffledOrder.splice(Math.floor(Math.random() * (shuffledOrder.length + 1)), 0, i);
-          }
-        }
-      } else {
-        staleRounds++;
-      }
-      lastCount = collectedUrls.size;
-
-      if (staleRounds >= 25 || container.scrollTop === beforeScroll) {
-        finishTopScroll();
-        return;
-      }
-
-      topScrollInterval = setTimeout(tick, 300);
-    }
-
-    function finishTopScroll() {
-      photoUrls = Array.from(collectedUrls);
-      showStatus(photoUrls.length + ' photos loaded');
-      const loader = document.getElementById('frameflow-loader');
-      if (loader) loader.style.display = 'none';
-      container.scrollTop = 0;
-    }
-
-    tick();
   }
 
   // ===== Start / Stop =====
@@ -610,10 +393,8 @@
       Object.assign(settings, opts);
     }
 
-    isRunning = true;
-    isPaused = false;
-    currentIndex = -1;
-    activeLayer = 'a';
+    isRunning = true; isPaused = false;
+    currentIndex = -1; activeLayer = 'a';
     photoUrls = Array.from(collectedUrls);
 
     createOverlay();
@@ -625,46 +406,47 @@
     if (photoUrls.length > 0) {
       buildShuffleOrder();
       setTimeout(() => {
-        const loader = document.getElementById('frameflow-loader');
-        if (loader) loader.style.display = 'none';
+        const ld = document.getElementById('frameflow-loader');
+        if (ld) ld.style.display = 'none';
         showNext();
       }, 1000);
     }
 
-    // Tell iframe to start scrolling
-    let iframeSentScroll = false;
-    const iframes = document.querySelectorAll('iframe');
-    iframes.forEach(iframe => {
-      try {
-        iframe.contentWindow.postMessage({
-          type: 'FRAMEFLOW_SCROLL',
-          targetCount: settings.targetPhotos || 500
-        }, '*');
-        iframeSentScroll = true;
-      } catch (e) {}
-    });
-
-    // Fallback: if no iframe found, scroll the top frame directly
-    if (!iframeSentScroll) {
-      console.log('[FrameFlow/top] No iframe found — scrolling top frame directly');
-      topFrameScroll(settings.targetPhotos || 500);
-    }
+    // Start scrolling to load more
+    autoScroll(settings.targetPhotos || 500,
+      (count) => {
+        photoUrls = Array.from(collectedUrls);
+        const c = document.getElementById('ff-photo-count');
+        if (c) c.textContent = count;
+        if (currentIndex < 0 && photoUrls.length > 0) {
+          buildShuffleOrder();
+          const ld = document.getElementById('frameflow-loader');
+          if (ld) ld.style.display = 'none';
+          showNext();
+        }
+        if (settings.shuffle) {
+          for (let i = shuffledOrder.length; i < photoUrls.length; i++) {
+            shuffledOrder.splice(Math.floor(Math.random() * (shuffledOrder.length + 1)), 0, i);
+          }
+        }
+      },
+      () => {
+        photoUrls = Array.from(collectedUrls);
+        showStatus(photoUrls.length + ' photos loaded');
+        const ld = document.getElementById('frameflow-loader');
+        if (ld) ld.style.display = 'none';
+        if (!photoUrls.length) showStatus('No photos found. Scroll the page manually first.');
+      }
+    );
 
     return photoUrls.length;
   }
 
   function stopSlideshow() {
-    isRunning = false;
-    isPaused = false;
-    clearTimeout(slideTimer);
-    clearTimeout(topScrollInterval);
+    isRunning = false; isPaused = false; isScrolling = false;
+    clearTimeout(slideTimer); clearTimeout(scrollTimer);
     removeOverlay();
     currentIndex = -1;
-
-    // Tell iframe to stop scrolling
-    document.querySelectorAll('iframe').forEach(iframe => {
-      try { iframe.contentWindow.postMessage({ type: 'FRAMEFLOW_STOP_SCROLL' }, '*'); } catch (e) {}
-    });
   }
 
   // ===== Message Handler =====
@@ -681,9 +463,26 @@
     return true;
   });
 
-  // Also scrape top frame
-  scrapeCurrentDoc().then(() => {
-    console.log('[FrameFlow/top] Initial scrape:', collectedUrls.size, 'photos');
+  // ===== Background collection =====
+  // Continuously scrape as user browses
+  let scrapeTimer = null, isCollecting = false;
+  async function bgScrape() {
+    if (isCollecting) return;
+    isCollecting = true;
+    await scrapeAll();
+    isCollecting = false;
+  }
+
+  const observer = new MutationObserver(() => {
+    clearTimeout(scrapeTimer);
+    scrapeTimer = setTimeout(bgScrape, 500);
   });
+  if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'style'] });
+  }
+  setInterval(bgScrape, 3000);
+
+  // Initial scrape
+  scrapeAll().then(() => console.log('[FrameFlow] Initial:', collectedUrls.size, 'photos'));
 
 })();
