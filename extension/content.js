@@ -527,6 +527,82 @@
     document.removeEventListener('keydown', handleKeydown);
   }
 
+  // ===== Top-frame scroll fallback =====
+  let topScrollInterval = null;
+
+  async function topFrameScroll(targetCount) {
+    // Find scroll container in top frame
+    let best = null, bestScore = 0;
+    document.querySelectorAll('*').forEach(el => {
+      const s = window.getComputedStyle(el);
+      if (s.overflowY === 'scroll' || s.overflowY === 'auto') {
+        const score = el.scrollHeight - el.clientHeight;
+        if (score > bestScore + 100) { bestScore = score; best = el; }
+      }
+    });
+    const container = best || document.documentElement;
+    console.log('[FrameFlow/top] Scroll container:', container.tagName, 'scrollHeight:', container.scrollHeight);
+
+    let staleRounds = 0, lastCount = collectedUrls.size;
+
+    async function tick() {
+      if (!isRunning) return;
+      if (targetCount > 0 && collectedUrls.size >= targetCount) {
+        console.log('[FrameFlow/top] Reached target:', collectedUrls.size);
+        finishTopScroll();
+        return;
+      }
+
+      const beforeScroll = container.scrollTop;
+      container.scrollTop += container.clientHeight;
+      window.scrollBy(0, window.innerHeight);
+
+      await new Promise(r => setTimeout(r, 1200));
+      await scrapeCurrentDoc();
+
+      photoUrls = Array.from(collectedUrls);
+      const countEl = document.getElementById('ff-photo-count');
+      if (countEl) countEl.textContent = photoUrls.length;
+
+      if (collectedUrls.size > lastCount) {
+        staleRounds = 0;
+        // Start slideshow if not started
+        if (currentIndex < 0 && photoUrls.length > 0) {
+          buildShuffleOrder();
+          const loader = document.getElementById('frameflow-loader');
+          if (loader) loader.style.display = 'none';
+          showNext();
+        }
+        // Extend shuffle
+        if (settings.shuffle) {
+          for (let i = shuffledOrder.length; i < photoUrls.length; i++) {
+            shuffledOrder.splice(Math.floor(Math.random() * (shuffledOrder.length + 1)), 0, i);
+          }
+        }
+      } else {
+        staleRounds++;
+      }
+      lastCount = collectedUrls.size;
+
+      if (staleRounds >= 25 || container.scrollTop === beforeScroll) {
+        finishTopScroll();
+        return;
+      }
+
+      topScrollInterval = setTimeout(tick, 300);
+    }
+
+    function finishTopScroll() {
+      photoUrls = Array.from(collectedUrls);
+      showStatus(photoUrls.length + ' photos loaded');
+      const loader = document.getElementById('frameflow-loader');
+      if (loader) loader.style.display = 'none';
+      container.scrollTop = 0;
+    }
+
+    tick();
+  }
+
   // ===== Start / Stop =====
   function startSlideshow(opts) {
     if (opts) {
@@ -556,6 +632,7 @@
     }
 
     // Tell iframe to start scrolling
+    let iframeSentScroll = false;
     const iframes = document.querySelectorAll('iframe');
     iframes.forEach(iframe => {
       try {
@@ -563,8 +640,15 @@
           type: 'FRAMEFLOW_SCROLL',
           targetCount: settings.targetPhotos || 500
         }, '*');
+        iframeSentScroll = true;
       } catch (e) {}
     });
+
+    // Fallback: if no iframe found, scroll the top frame directly
+    if (!iframeSentScroll) {
+      console.log('[FrameFlow/top] No iframe found — scrolling top frame directly');
+      topFrameScroll(settings.targetPhotos || 500);
+    }
 
     return photoUrls.length;
   }
@@ -573,6 +657,7 @@
     isRunning = false;
     isPaused = false;
     clearTimeout(slideTimer);
+    clearTimeout(topScrollInterval);
     removeOverlay();
     currentIndex = -1;
 
