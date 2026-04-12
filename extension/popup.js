@@ -13,6 +13,10 @@ chrome.storage.local.get(['frameflow_settings'], (result) => {
   if (s.transition) document.getElementById('set-transition').value = s.transition;
   if (s.fill) document.getElementById('set-fill').value = s.fill;
   if (s.targetPhotos !== undefined) document.getElementById('set-photo-count').value = s.targetPhotos;
+  if (s.hiRes !== undefined) {
+    document.getElementById('set-hires').checked = s.hiRes;
+    document.getElementById('hires-note').style.display = s.hiRes ? 'block' : 'none';
+  }
   if (s.kenBurns !== undefined) document.getElementById('set-kenburns').checked = s.kenBurns;
   if (s.duration) {
     document.getElementById('set-duration').value = s.duration;
@@ -27,7 +31,8 @@ function getSettings() {
     fill: document.getElementById('set-fill').value,
     kenBurns: document.getElementById('set-kenburns').checked,
     duration: parseInt(document.getElementById('set-duration').value, 10),
-    targetPhotos: parseInt(document.getElementById('set-photo-count').value, 10)
+    targetPhotos: parseInt(document.getElementById('set-photo-count').value, 10),
+    hiRes: document.getElementById('set-hires').checked
   };
 }
 
@@ -38,6 +43,11 @@ function saveSettings() {
 // Save on change
 document.querySelectorAll('input, select').forEach(el => {
   el.addEventListener('change', saveSettings);
+});
+
+document.getElementById('set-hires').addEventListener('change', (e) => {
+  document.getElementById('hires-note').style.display = e.target.checked ? 'block' : 'none';
+  saveSettings();
 });
 
 document.getElementById('set-duration').addEventListener('input', (e) => {

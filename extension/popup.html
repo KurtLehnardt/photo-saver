@@ -127,7 +127,7 @@
 
   <div id="status" class="status">Checking page...</div>
 
-  <div class="setting" style="margin-bottom:12px">
+  <div class="setting" style="margin-bottom:8px">
     <span>Photos to load</span>
     <select id="set-photo-count">
       <option value="100">100</option>
@@ -136,6 +136,13 @@
       <option value="1000">1000</option>
       <option value="0">All (slow)</option>
     </select>
+  </div>
+  <div class="setting" style="margin-bottom:12px">
+    <span>Hi-Res Mode</span>
+    <input type="checkbox" id="set-hires">
+  </div>
+  <div id="hires-note" style="font-size:11px;color:rgba(255,255,255,0.4);margin-bottom:12px;display:none">
+    Clicks through each photo for full resolution. Slower but much better quality.
   </div>
 
   <button id="btn-start">Start Slideshow</button>
