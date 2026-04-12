@@ -81,7 +81,12 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       btnStart.style.display = 'none';
       btnStop.style.display = 'block';
     } else {
-      statusEl.textContent = 'Ready — ' + (response.photoCount || 0) + ' photos detected';
+      const count = response.photoCount || 0;
+      if (count > 0) {
+        statusEl.textContent = 'Ready — ' + count + ' photos detected';
+      } else {
+        statusEl.textContent = 'Ready — photos will be captured on start';
+      }
       statusEl.className = 'status ok';
       btnStart.disabled = false;
     }

@@ -502,7 +502,9 @@
   // ===== Message Handler =====
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'PING') {
-      sendResponse({ ok: true, running: isRunning, photoCount: collectedUrls.size });
+      // Report iframe photo count if we haven't captured yet, otherwise captured count
+      const count = collectedUrls.size > 0 ? collectedUrls.size : iframePhotoPositions.length;
+      sendResponse({ ok: true, running: isRunning, photoCount: count });
     } else if (msg.type === 'START_SLIDESHOW') {
       const count = startSlideshow(msg.settings);
       sendResponse({ ok: true, photoCount: count });
