@@ -130,7 +130,7 @@ router.get('/settings', (req, res) => {
 
 // POST /api/settings - Update settings
 router.post('/settings', express.json(), (req, res) => {
-  const allowed = ['shuffle', 'transition', 'kenBurns', 'muted', 'duration', 'paused'];
+  const allowed = ['shuffle', 'transition', 'fill', 'kenBurns', 'muted', 'duration', 'paused'];
   const updates = {};
   for (const key of allowed) {
     if (req.body[key] !== undefined) {

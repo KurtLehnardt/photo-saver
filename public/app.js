@@ -8,6 +8,7 @@
   var settings = {
     shuffle: true,
     transition: 'fade',
+    fill: 'contain',
     kenBurns: true,
     muted: true,
     duration: 8,
@@ -222,7 +223,7 @@
 
   function clearLayer(layer) {
     KB_CLASSES.forEach(function(c) { layer.classList.remove(c); });
-    layer.classList.remove('kenburns', 'slide-enter', 'slide-exit', 'no-transition');
+    layer.classList.remove('kenburns', 'slide-enter', 'slide-exit', 'no-transition', 'fill-cover');
     layer.innerHTML = '';
   }
 
@@ -232,6 +233,11 @@
     const slide = slides[index];
     const layer = getInactiveLayer();
     clearLayer(layer);
+
+    // Apply fill mode
+    if (settings.fill === 'cover') {
+      layer.classList.add('fill-cover');
+    }
 
     currentIndex = index;
 
@@ -442,6 +448,18 @@
     saveSettings({ transition: settings.transition });
   });
 
+  document.getElementById('set-fill').addEventListener('change', function(e) {
+    settings.fill = e.target.value;
+    saveSettings({ fill: settings.fill });
+    // Apply to current active layer immediately
+    var active = getActiveLayerEl();
+    if (settings.fill === 'cover') {
+      active.classList.add('fill-cover');
+    } else {
+      active.classList.remove('fill-cover');
+    }
+  });
+
   document.getElementById('set-kenburns').addEventListener('change', function(e) {
     settings.kenBurns = e.target.checked;
     saveSettings({ kenBurns: settings.kenBurns });
@@ -552,6 +570,7 @@
   function applySettingsToUI() {
     document.getElementById('set-shuffle').checked = settings.shuffle;
     document.getElementById('set-transition').value = settings.transition;
+    document.getElementById('set-fill').value = settings.fill || 'contain';
     document.getElementById('set-kenburns').checked = settings.kenBurns;
     document.getElementById('set-muted').checked = settings.muted;
     document.getElementById('set-duration').value = settings.duration;
