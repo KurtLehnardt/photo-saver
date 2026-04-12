@@ -11,6 +11,7 @@ chrome.storage.local.get(['frameflow_settings'], (result) => {
   const s = result.frameflow_settings || {};
   if (s.shuffle !== undefined) document.getElementById('set-shuffle').checked = s.shuffle;
   if (s.transition) document.getElementById('set-transition').value = s.transition;
+  if (s.fill) document.getElementById('set-fill').value = s.fill;
   if (s.kenBurns !== undefined) document.getElementById('set-kenburns').checked = s.kenBurns;
   if (s.duration) {
     document.getElementById('set-duration').value = s.duration;
@@ -22,6 +23,7 @@ function getSettings() {
   return {
     shuffle: document.getElementById('set-shuffle').checked,
     transition: document.getElementById('set-transition').value,
+    fill: document.getElementById('set-fill').value,
     kenBurns: document.getElementById('set-kenburns').checked,
     duration: parseInt(document.getElementById('set-duration').value, 10)
   };

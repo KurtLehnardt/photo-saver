@@ -654,7 +654,11 @@
 
   // ===== Start / Stop =====
   function startSlideshow(opts) {
-    if (opts) Object.assign(settings, opts);
+    if (opts) {
+      // Ensure fill has a default
+      if (!opts.fill) opts.fill = 'contain';
+      Object.assign(settings, opts);
+    }
 
     isRunning = true;
     isPaused = false;
@@ -665,6 +669,10 @@
     photoUrls = Array.from(collectedUrls);
 
     createOverlay();
+
+    // Sync settings panel with current settings
+    const fillEl = document.getElementById('ff-set-fill');
+    if (fillEl) fillEl.value = settings.fill || 'contain';
     const overlay = document.getElementById('frameflow-overlay');
     const loader = document.getElementById('frameflow-loader');
     const countEl = document.getElementById('ff-photo-count');
