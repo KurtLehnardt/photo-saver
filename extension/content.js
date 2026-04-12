@@ -122,8 +122,14 @@
   // ================================================================
 
   const collectedUrls = new Set();
+  const hiddenUrls = new Set();
   const brokenUrls = new Set();
   let photoUrls = [];
+
+  function rebuildPhotoUrls() {
+    photoUrls = rebuildPhotoUrls().filter(u => !hiddenUrls.has(u));
+    return photoUrls;
+  }
   let isRunning = false, isPaused = false;
   let settings = {
     shuffle: true, transition: 'fade', fill: 'contain',
@@ -168,7 +174,7 @@
       } else {
         // Unsolicited capture (from periodic scanning) — add to collection
         collectedUrls.add(e.data.dataUrl);
-        photoUrls = Array.from(collectedUrls);
+        photoUrls = rebuildPhotoUrls();
       }
     }
   });
@@ -186,6 +192,11 @@
         }
       }, timeoutMs || 3000);
     });
+  }
+
+  function updateHiddenCount() {
+    const btn = document.getElementById('ff-btn-unhide-all');
+    if (btn) btn.textContent = 'Unhide All (' + hiddenUrls.size + ' hidden)';
   }
 
   function saveExtSettings() {
@@ -362,7 +373,7 @@
           staleCount = 0;
           progressDiv.textContent = 'Capturing ' + captured + ' / ' + maxTarget;
           onProgress(captured);
-          photoUrls = Array.from(collectedUrls);
+          photoUrls = rebuildPhotoUrls();
 
           const method = iframeCanCapture ? 'direct capture' : 'screenshot';
           console.log('[FrameFlow] #' + captured + ' via ' + method);
@@ -384,7 +395,7 @@
         await sendRealKey('Escape');
         await new Promise(r => setTimeout(r, 800));
 
-        photoUrls = Array.from(collectedUrls);
+        photoUrls = rebuildPhotoUrls();
         console.log('[FrameFlow] Captured', captured, 'photos');
 
         // Show overlay and start slideshow
@@ -527,7 +538,7 @@
     ov.innerHTML = '<div id="ff-layer-a" class="ff-layer active"></div><div id="ff-layer-b" class="ff-layer"></div>';
     const ctrl = document.createElement('div');
     ctrl.id = 'frameflow-controls';
-    ctrl.innerHTML = '<button id="ff-prev" title="Previous">&#9664;</button><button id="ff-playpause" title="Pause">&#10074;&#10074;</button><button id="ff-next" title="Next">&#9654;</button><button id="ff-settings-btn" title="Settings">&#9881;</button><button id="ff-exit" title="Exit">&#10005;</button>';
+    ctrl.innerHTML = '<button id="ff-prev" title="Previous">&#9664;</button><button id="ff-playpause" title="Pause">&#10074;&#10074;</button><button id="ff-next" title="Next">&#9654;</button><button id="ff-hide-current" title="Hide this photo">&#128683;</button><button id="ff-settings-btn" title="Settings">&#9881;</button><button id="ff-exit" title="Exit">&#10005;</button>';
     const sp = document.createElement('div');
     sp.id = 'ff-settings-panel';
     sp.innerHTML = `
@@ -539,7 +550,8 @@
       <div class="ff-setting"><span>Transition</span>
         <select id="ff-set-transition"><option value="fade"${settings.transition==='fade'?' selected':''}>Fade</option><option value="slide"${settings.transition==='slide'?' selected':''}>Slide</option><option value="none"${settings.transition==='none'?' selected':''}>None</option></select></div>
       <div class="ff-setting"><span>Ken Burns</span><input type="checkbox" id="ff-set-kenburns"${settings.kenBurns?' checked':''}></div>
-      <div class="ff-setting"><span>Duration</span><div class="ff-range-wrap"><input type="range" id="ff-set-duration" min="3" max="30" value="${settings.duration}"><span id="ff-duration-val">${settings.duration}s</span></div></div>`;
+      <div class="ff-setting"><span>Duration</span><div class="ff-range-wrap"><input type="range" id="ff-set-duration" min="3" max="30" value="${settings.duration}"><span id="ff-duration-val">${settings.duration}s</span></div></div>
+      <div class="ff-setting" style="margin-top:8px"><button id="ff-btn-unhide-all" style="width:100%;padding:8px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);border-radius:6px;color:#fff;font-size:13px;cursor:pointer">Unhide All (0 hidden)</button></div>`;
     const st = document.createElement('div'); st.id = 'frameflow-status';
     const ld = document.createElement('div'); ld.id = 'frameflow-loader';
     ld.innerHTML = '<div class="ff-count" id="ff-photo-count">0</div><div class="ff-label" id="ff-loader-label">loading...</div>';
@@ -556,6 +568,21 @@
     document.getElementById('ff-next').addEventListener('click', e => { e.stopPropagation(); showNext(); });
     document.getElementById('ff-playpause').addEventListener('click', e => { e.stopPropagation(); togglePause(); });
     document.getElementById('ff-exit').addEventListener('click', e => { e.stopPropagation(); stopSlideshow(); });
+
+    // Hide current photo
+    document.getElementById('ff-hide-current').addEventListener('click', e => {
+      e.stopPropagation();
+      if (currentIndex >= 0 && currentIndex < photoUrls.length) {
+        const url = photoUrls[currentIndex];
+        hiddenUrls.add(url);
+        rebuildPhotoUrls();
+        buildShuffleOrder();
+        updateHiddenCount();
+        showStatus('Photo hidden (' + hiddenUrls.size + ' hidden)');
+        showNext();
+      }
+    });
+
     document.getElementById('ff-settings-btn').addEventListener('click', e => {
       e.stopPropagation(); document.getElementById('ff-settings-panel').classList.toggle('visible');
     });
@@ -576,6 +603,18 @@
       document.getElementById('ff-duration-val').textContent = settings.duration + 's';
     });
     document.getElementById('ff-set-duration').addEventListener('change', e => { settings.duration = parseInt(e.target.value, 10); saveExtSettings(); });
+
+    // Unhide all
+    document.getElementById('ff-btn-unhide-all').addEventListener('click', e => {
+      e.stopPropagation();
+      if (hiddenUrls.size === 0) return;
+      hiddenUrls.clear();
+      rebuildPhotoUrls();
+      buildShuffleOrder();
+      updateHiddenCount();
+      showStatus('All photos unhidden');
+    });
+
     document.addEventListener('keydown', handleKeydown);
   }
 
@@ -595,7 +634,7 @@
     viewHistory = []; historyPos = -1;
 
     // Use cached photos if available
-    photoUrls = Array.from(collectedUrls);
+    photoUrls = rebuildPhotoUrls();
 
     createOverlay();
     document.getElementById('frameflow-overlay').classList.add('active');
@@ -620,9 +659,9 @@
 
       loadHiResPhotos(settings.targetPhotos || 10, (count) => {
         if (countEl) countEl.textContent = count + ' / ' + (settings.targetPhotos || 10);
-        photoUrls = Array.from(collectedUrls);
+        photoUrls = rebuildPhotoUrls();
       }, () => {
-        photoUrls = Array.from(collectedUrls);
+        photoUrls = rebuildPhotoUrls();
         showStatus(photoUrls.length + ' photos captured');
         const ld = document.getElementById('frameflow-loader');
         if (ld) ld.style.display = 'none';
