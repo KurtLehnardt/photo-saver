@@ -1,0 +1,179 @@
+/* FrameFlow iCloud Photos Overlay */
+
+#frameflow-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 999999;
+  background: #000;
+  display: none;
+}
+
+#frameflow-overlay.active {
+  display: block;
+}
+
+/* Slide layers */
+#frameflow-overlay .ff-layer {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 1.5s ease;
+  z-index: 1;
+}
+
+#frameflow-overlay .ff-layer.active {
+  opacity: 1;
+  z-index: 2;
+}
+
+#frameflow-overlay .ff-layer.slide-enter {
+  transform: translateX(100%);
+  opacity: 1;
+  transition: transform 0.8s ease, opacity 0.1s;
+}
+#frameflow-overlay .ff-layer.slide-enter.active {
+  transform: translateX(0);
+  opacity: 1;
+}
+#frameflow-overlay .ff-layer.slide-exit {
+  transform: translateX(-100%);
+  opacity: 0;
+  transition: transform 0.8s ease, opacity 0.1s;
+}
+
+#frameflow-overlay .ff-layer.no-transition {
+  transition: none;
+}
+
+#frameflow-overlay .ff-layer img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+/* Ken Burns */
+@keyframes ff-kb-1 {
+  0% { transform: scale(1) translate(0, 0); }
+  100% { transform: scale(1.08) translate(-2%, -1%); }
+}
+@keyframes ff-kb-2 {
+  0% { transform: scale(1.08) translate(-2%, 1%); }
+  100% { transform: scale(1) translate(0, 0); }
+}
+@keyframes ff-kb-3 {
+  0% { transform: scale(1) translate(0, 0); }
+  100% { transform: scale(1.06) translate(2%, -1%); }
+}
+@keyframes ff-kb-4 {
+  0% { transform: scale(1.06) translate(1%, 2%); }
+  100% { transform: scale(1) translate(0, 0); }
+}
+
+#frameflow-overlay .ff-kenburns img {
+  animation-duration: 12s;
+  animation-fill-mode: forwards;
+  animation-timing-function: ease-in-out;
+}
+
+#frameflow-overlay .ff-kb-1 img { animation-name: ff-kb-1; }
+#frameflow-overlay .ff-kb-2 img { animation-name: ff-kb-2; }
+#frameflow-overlay .ff-kb-3 img { animation-name: ff-kb-3; }
+#frameflow-overlay .ff-kb-4 img { animation-name: ff-kb-4; }
+
+/* Controls */
+#frameflow-controls {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000000;
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  padding: 20px;
+  background: linear-gradient(transparent, rgba(0,0,0,0.7));
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+}
+
+#frameflow-controls.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+#frameflow-controls button {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255,255,255,0.15);
+  color: #fff;
+  font-size: 20px;
+  cursor: pointer;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#frameflow-controls button:hover {
+  background: rgba(255,255,255,0.25);
+}
+
+/* Status bar */
+#frameflow-status {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 1000000;
+  padding: 8px 16px;
+  background: rgba(0,0,0,0.7);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-radius: 8px;
+  color: rgba(255,255,255,0.7);
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 13px;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+}
+
+#frameflow-status.visible {
+  opacity: 1;
+}
+
+/* Photo counter during loading */
+#frameflow-loader {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000000;
+  text-align: center;
+  color: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+#frameflow-loader .ff-count {
+  font-size: 48px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+#frameflow-loader .ff-label {
+  font-size: 16px;
+  color: rgba(255,255,255,0.5);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #frameflow-overlay .ff-layer { transition-duration: 0.1s; }
+  #frameflow-overlay .ff-kenburns img { animation: none !important; }
+}
