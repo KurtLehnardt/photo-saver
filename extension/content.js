@@ -121,62 +121,124 @@
   }
 
   // ===== Hi-Res: Click through iCloud detail view =====
-  // Opens first photo, navigates with arrow keys, captures each full-res image
-  async function loadHiResPhotos(target, onProgress, onDone) {
-    console.log('[FrameFlow] Hi-res mode: clicking through detail view for ~' + target + ' photos');
-    const overlay = document.getElementById('frameflow-overlay');
+  function sendKey(key, targetEl) {
+    const opts = { key, code: key, bubbles: true, cancelable: true };
+    const el = targetEl || document.activeElement || document.body;
+    el.dispatchEvent(new KeyboardEvent('keydown', opts));
+    el.dispatchEvent(new KeyboardEvent('keyup', opts));
+  }
 
-    // Hide overlay so we can interact with iCloud
-    if (overlay) overlay.style.display = 'none';
-
-    await new Promise(r => setTimeout(r, 500));
-
-    // Find and click the first photo thumbnail
+  function getAllDocs() {
     const docs = [document];
     document.querySelectorAll('iframe').forEach(f => {
       try { if (f.contentDocument) docs.push(f.contentDocument); } catch (e) {}
     });
+    return docs;
+  }
 
+  async function loadHiResPhotos(target, onProgress, onDone) {
+    const maxTarget = target || 500;
+    console.log('[FrameFlow] Hi-res mode: target', maxTarget, 'photos');
+    const overlay = document.getElementById('frameflow-overlay');
+
+    // Hide overlay to interact with iCloud
+    if (overlay) overlay.style.display = 'none';
+    await new Promise(r => setTimeout(r, 800));
+
+    // Try multiple strategies to click a photo
     let clicked = false;
+    const docs = getAllDocs();
+
     for (const doc of docs) {
-      // Look for clickable photo elements
-      const imgs = doc.querySelectorAll('img');
-      for (const img of imgs) {
-        if (img.naturalWidth < 50 || img.naturalHeight < 50) continue;
-        const src = img.src || '';
-        if (isExcluded(src) && !src.startsWith('blob:')) continue;
-        // Click the image or its parent (which may be the clickable element)
-        const target = img.closest('a, button, [role="button"], [tabindex]') || img.parentElement || img;
-        target.click();
-        clicked = true;
-        break;
-      }
       if (clicked) break;
+
+      // Strategy 1: Find img with blob src and click its ancestors
+      for (const img of doc.querySelectorAll('img')) {
+        if (img.naturalWidth < 30 || img.naturalHeight < 30) continue;
+        const src = img.src || '';
+        if (!src.startsWith('blob:') && isExcluded(src)) continue;
+
+        // Try clicking progressively up the DOM tree
+        let el = img;
+        for (let depth = 0; depth < 5 && el; depth++) {
+          console.log('[FrameFlow] Trying click on', el.tagName, el.className ? '.' + el.className.substring(0, 30) : '');
+          el.click();
+          // Also try synthetic mouse events
+          el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+          await new Promise(r => setTimeout(r, 800));
+
+          // Check if detail view opened (look for a much larger image)
+          let foundLarger = false;
+          for (const d of docs) {
+            for (const bigImg of d.querySelectorAll('img')) {
+              if (bigImg.complete && bigImg.naturalWidth > 400 && bigImg.naturalHeight > 400) {
+                foundLarger = true; break;
+              }
+            }
+            if (foundLarger) break;
+          }
+
+          if (foundLarger) {
+            console.log('[FrameFlow] Detail view opened!');
+            clicked = true;
+            break;
+          }
+          el = el.parentElement;
+        }
+        if (clicked) break;
+      }
+
+      // Strategy 2: Double-click
+      if (!clicked) {
+        for (const img of doc.querySelectorAll('img')) {
+          if (img.naturalWidth < 30) continue;
+          const src = img.src || '';
+          if (!src.startsWith('blob:') && isExcluded(src)) continue;
+          img.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+          await new Promise(r => setTimeout(r, 1000));
+
+          let foundLarger = false;
+          for (const d of docs) {
+            for (const bigImg of d.querySelectorAll('img')) {
+              if (bigImg.complete && bigImg.naturalWidth > 400) { foundLarger = true; break; }
+            }
+            if (foundLarger) break;
+          }
+          if (foundLarger) { clicked = true; console.log('[FrameFlow] Detail view opened via dblclick!'); break; }
+        }
+      }
     }
 
     if (!clicked) {
-      console.log('[FrameFlow] Could not find a photo to click');
+      console.log('[FrameFlow] Could not open detail view. Falling back to thumbnail mode.');
       if (overlay) overlay.style.display = '';
+      showStatus('Hi-res: could not open photo detail view. Using thumbnails.');
       onDone();
       return;
     }
 
-    // Wait for detail view to open
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 1500));
 
+    // Now capture photos from detail view
     let captured = 0;
-    const maxTarget = target || 500;
+    let lastCapturedSize = '';
     let staleCount = 0;
 
+    // Use a separate set for hi-res captures (don't mix with thumbnail URLs)
+    const hiResUrls = new Set();
+
     async function captureAndAdvance() {
-      if (!isRunning || (maxTarget > 0 && captured >= maxTarget)) {
+      if (!isRunning || captured >= maxTarget) {
         closeAndFinish();
         return;
       }
 
-      // Find the largest image on screen (should be the detail view photo)
+      // Find the largest image (detail view photo)
       let bestImg = null, bestSize = 0;
-      for (const doc of docs) {
+      for (const doc of getAllDocs()) {
         for (const img of doc.querySelectorAll('img')) {
           if (!img.complete) continue;
           const size = img.naturalWidth * img.naturalHeight;
@@ -185,24 +247,23 @@
       }
 
       if (bestImg && bestImg.naturalWidth >= 200) {
-        const src = bestImg.src || '';
-        const key = src.startsWith('blob:') ? 'blob_' + bestImg.naturalWidth + 'x' + bestImg.naturalHeight + '_' + captured : src;
+        const sizeKey = bestImg.naturalWidth + 'x' + bestImg.naturalHeight + '_' + bestImg.src.substring(0, 50);
 
-        if (!collectedUrls.has(key)) {
+        if (sizeKey !== lastCapturedSize) {
           try {
             const blobUrl = await captureImage(bestImg, 4096);
             if (blobUrl) {
+              hiResUrls.add(blobUrl);
               collectedUrls.add(blobUrl);
-              // Also cache it as hi-res for the slideshow
-              const idx = collectedUrls.size - 1;
-              cacheSet(idx, blobUrl);
               captured++;
+              lastCapturedSize = sizeKey;
               staleCount = 0;
-              photoUrls = Array.from(collectedUrls);
               onProgress(captured);
-              console.log('[FrameFlow] Hi-res captured #' + captured + ' (' + bestImg.naturalWidth + 'x' + bestImg.naturalHeight + ')');
+              console.log('[FrameFlow] Hi-res #' + captured + ': ' + bestImg.naturalWidth + 'x' + bestImg.naturalHeight);
             }
-          } catch (e) {}
+          } catch (e) {
+            console.warn('[FrameFlow] Capture failed:', e.message);
+          }
         } else {
           staleCount++;
         }
@@ -210,33 +271,40 @@
         staleCount++;
       }
 
-      if (staleCount > 5) {
-        // Might be stuck, try to advance anyway
-        staleCount = 0;
+      // Navigate to next photo
+      sendKey('ArrowRight');
+      // Also try on iframes
+      for (const doc of getAllDocs()) {
+        if (doc !== document) {
+          try { sendKey('ArrowRight', doc.body || doc.documentElement); } catch (e) {}
+        }
       }
 
-      // Press right arrow to go to next photo
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', bubbles: true }));
+      await new Promise(r => setTimeout(r, 2000));
 
-      // Wait for next photo to load
-      await new Promise(r => setTimeout(r, 1500));
-
-      if (captured < maxTarget) {
-        scrollTimer = setTimeout(captureAndAdvance, 100);
-      } else {
+      if (staleCount > 8) {
+        console.log('[FrameFlow] Stale after', staleCount, 'rounds. Finishing.');
         closeAndFinish();
+        return;
       }
+
+      scrollTimer = setTimeout(captureAndAdvance, 100);
     }
 
     function closeAndFinish() {
-      // Close detail view
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+      sendKey('Escape');
+      for (const doc of getAllDocs()) {
+        if (doc !== document) {
+          try { sendKey('Escape', doc.body || doc.documentElement); } catch (e) {}
+        }
+      }
+
       setTimeout(() => {
         if (overlay) overlay.style.display = '';
         photoUrls = Array.from(collectedUrls);
-        console.log('[FrameFlow] Hi-res complete:', captured, 'photos captured');
+        console.log('[FrameFlow] Hi-res complete:', captured, 'of', maxTarget, 'captured');
         onDone();
-      }, 500);
+      }, 800);
     }
 
     captureAndAdvance();
@@ -554,15 +622,18 @@
 
     const countEl = document.getElementById('ff-photo-count');
     const labelEl = document.getElementById('ff-loader-label');
-    if (countEl) countEl.textContent = photoUrls.length;
 
     if (settings.hiRes) {
-      // Hi-res mode: click through photos in detail view
-      if (labelEl) labelEl.textContent = 'capturing hi-res photos (this takes a moment)...';
+      // Hi-res mode: reset counter and click through photos
+      if (countEl) countEl.textContent = '0';
+      if (labelEl) labelEl.textContent = 'opening photo viewer for hi-res capture...';
 
-      loadHiResPhotos(settings.targetPhotos || 500,
+      const hiResTarget = settings.targetPhotos || 10;
+
+      loadHiResPhotos(hiResTarget,
         (count) => {
-          if (countEl) countEl.textContent = count;
+          if (countEl) countEl.textContent = count + ' / ' + hiResTarget;
+          if (labelEl) labelEl.textContent = 'capturing hi-res photos...';
           photoUrls = Array.from(collectedUrls);
 
           // Start slideshow as soon as we have a few photos
