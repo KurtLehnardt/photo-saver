@@ -199,7 +199,16 @@
     async function step() {
       if (!isRunning || captured >= maxTarget) { finish(); return; }
 
+      // Hide ALL our UI before taking screenshot
+      progressDiv.style.display = 'none';
+      if (overlay) overlay.style.display = 'none';
+      // Small delay for browser to repaint without our elements
+      await new Promise(r => setTimeout(r, 100));
+
       const dataUrl = await captureScreenshot();
+
+      // Show progress again
+      progressDiv.style.display = '';
 
       if (dataUrl && dataUrl !== lastDataUrl) {
         lastDataUrl = dataUrl;
@@ -208,24 +217,7 @@
         staleCount = 0;
         progressDiv.textContent = 'Capturing ' + captured + ' / ' + maxTarget;
         onProgress(captured);
-
-        // Start slideshow as soon as we have a few
-        if (currentIndex < 0 && collectedUrls.size >= 2) {
-          photoUrls = Array.from(collectedUrls);
-          buildShuffleOrder();
-          if (overlay) { overlay.style.display = ''; overlay.classList.add('active'); }
-          const ld = document.getElementById('frameflow-loader');
-          if (ld) ld.style.display = 'none';
-          showNext();
-        }
-
-        // Extend shuffle
         photoUrls = Array.from(collectedUrls);
-        if (settings.shuffle) {
-          for (let i = shuffledOrder.length; i < photoUrls.length; i++) {
-            shuffledOrder.splice(Math.floor(Math.random() * (shuffledOrder.length + 1)), 0, i);
-          }
-        }
       } else {
         staleCount++;
       }
@@ -240,11 +232,26 @@
 
     async function finish() {
       progressDiv.remove();
+      // Close iCloud detail view
       await sendRealKey('Escape');
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 800));
+
       photoUrls = Array.from(collectedUrls);
-      if (overlay) { overlay.style.display = ''; }
-      console.log('[FrameFlow] Hi-res done:', captured, 'captured');
+      console.log('[FrameFlow] Hi-res done:', captured, 'captured. Starting slideshow.');
+
+      // Now show overlay and start slideshow
+      if (overlay) {
+        overlay.style.display = '';
+        overlay.classList.add('active');
+      }
+      const ld = document.getElementById('frameflow-loader');
+      if (ld) ld.style.display = 'none';
+
+      if (photoUrls.length > 0) {
+        buildShuffleOrder();
+        showNext();
+      }
+
       onDone();
     }
 
