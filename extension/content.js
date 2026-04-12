@@ -116,9 +116,44 @@
     });
   }
 
+  // Crop canvas for extracting the photo from a full-page screenshot
+  const cropCanvas = document.createElement('canvas');
+  const cropCtx = cropCanvas.getContext('2d');
+
   async function captureScreenshot() {
     const resp = await sendMessage({ type: 'CAPTURE_TAB' });
-    return resp ? resp.dataUrl : null;
+    if (!resp || !resp.dataUrl) return null;
+
+    // Crop the screenshot to remove iCloud UI (top bar, bottom carousel)
+    // iCloud detail view layout:
+    //   - Top ~44-60px: navigation/close button bar
+    //   - Bottom ~80-120px: thumbnail carousel strip
+    //   - Left/Right: arrow buttons (small, ok to include)
+    return new Promise(resolve => {
+      const img = new Image();
+      img.onload = () => {
+        const w = img.naturalWidth;
+        const h = img.naturalHeight;
+
+        // Crop percentages (these work for iCloud's detail view layout)
+        const topCrop = Math.round(h * 0.06);    // ~6% from top (nav bar)
+        const bottomCrop = Math.round(h * 0.12);  // ~12% from bottom (carousel)
+        const sideCrop = Math.round(w * 0.02);    // ~2% from sides (minimal)
+
+        const cw = w - sideCrop * 2;
+        const ch = h - topCrop - bottomCrop;
+
+        cropCanvas.width = cw;
+        cropCanvas.height = ch;
+        cropCtx.drawImage(img, sideCrop, topCrop, cw, ch, 0, 0, cw, ch);
+
+        cropCanvas.toBlob(blob => {
+          resolve(blob ? URL.createObjectURL(blob) : resp.dataUrl);
+        }, 'image/jpeg', 0.95);
+      };
+      img.onerror = () => resolve(resp.dataUrl); // fallback to uncropped
+      img.src = resp.dataUrl;
+    });
   }
 
   async function sendRealKey(key) {
