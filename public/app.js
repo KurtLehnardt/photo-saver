@@ -20,6 +20,8 @@
   var activeLayer = 'a';
   var isShowingOverlay = false;
   var isShowingControls = false;
+  var slideHistory = [];
+  var historyPos = -1;
   var source = localStorage.getItem('frameflow_source') || null; // 'local' or 'google'
 
   // DOM refs
@@ -304,14 +306,26 @@
 
   function showNext() {
     clearTimeout(timer);
-    const idx = getNextIndex();
-    if (idx >= 0) loadSlide(idx, 'next');
+    // If browsing back through history, move forward first
+    if (historyPos >= 0 && historyPos < slideHistory.length - 1) {
+      historyPos++;
+      loadSlide(slideHistory[historyPos], 'next');
+      return;
+    }
+    var idx = getNextIndex();
+    if (idx >= 0) {
+      slideHistory.push(idx);
+      historyPos = slideHistory.length - 1;
+      if (slideHistory.length > 500) { slideHistory.shift(); historyPos--; }
+      loadSlide(idx, 'next');
+    }
   }
 
   function showPrev() {
     clearTimeout(timer);
-    const idx = getPrevIndex();
-    if (idx >= 0) loadSlide(idx, 'prev');
+    if (slideHistory.length === 0 || historyPos <= 0) return;
+    historyPos--;
+    loadSlide(slideHistory[historyPos], 'prev');
   }
 
   function scheduleNext() {

@@ -27,6 +27,8 @@
   let slideTimer = null, controlsTimer = null, scrollTimer = null;
   let currentIndex = -1, shuffledOrder = [], shuffleIndex = 0;
   let activeLayer = 'a';
+  let history = []; // indices of previously shown slides
+  let historyPos = -1; // current position in history (-1 = at the end)
 
   function saveExtSettings() {
     chrome.storage.local.set({ frameflow_settings: settings });
@@ -276,8 +278,31 @@
     layer.appendChild(img);
   }
 
-  function showNext() { clearTimeout(slideTimer); const i = getNextIndex(); if (i >= 0) loadSlide(i); }
-  function showPrev() { clearTimeout(slideTimer); const i = getPrevIndex(); if (i >= 0) loadSlide(i); }
+  function showNext() {
+    clearTimeout(slideTimer);
+    // If we're browsing back through history, move forward in history first
+    if (historyPos >= 0 && historyPos < history.length - 1) {
+      historyPos++;
+      loadSlide(history[historyPos], true);
+      return;
+    }
+    // Otherwise get next slide and add to history
+    const i = getNextIndex();
+    if (i >= 0) {
+      history.push(i);
+      historyPos = history.length - 1;
+      // Cap history at 500 entries
+      if (history.length > 500) { history.shift(); historyPos--; }
+      loadSlide(i, true);
+    }
+  }
+
+  function showPrev() {
+    clearTimeout(slideTimer);
+    if (history.length === 0 || historyPos <= 0) return; // nothing to go back to
+    historyPos--;
+    loadSlide(history[historyPos], true);
+  }
   function scheduleNext() { clearTimeout(slideTimer); if (!isPaused && photoUrls.length) slideTimer = setTimeout(showNext, settings.duration * 1000); }
 
   // ===== Controls =====
@@ -395,6 +420,7 @@
 
     isRunning = true; isPaused = false;
     currentIndex = -1; activeLayer = 'a';
+    history = []; historyPos = -1;
     photoUrls = Array.from(collectedUrls);
 
     createOverlay();
