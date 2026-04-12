@@ -399,8 +399,60 @@
   const cropCanvas = document.createElement('canvas');
   const cropCtx = cropCanvas.getContext('2d');
 
+  // Hide iCloud's UI overlays before screenshot, restore after
+  function hideiCloudChrome() {
+    let style = document.getElementById('ff-hide-icloud');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'ff-hide-icloud';
+      document.head.appendChild(style);
+    }
+    // Hide known iCloud UI elements that appear over photos
+    style.textContent = `
+      .OneUp-leadingTopBadges, .OneUp-trailingTopBadges,
+      .OneUpBadge, .OneUp-hdrVideoBadge,
+      .OneUp-toolbar, .OneUp-bottomBar,
+      .FilmStrip, .film-strip, [class*="filmstrip"],
+      [class*="TopBar"], [class*="topbar"],
+      [class*="toolbar"], [class*="Toolbar"],
+      [class*="navigation"], [class*="Navigation"],
+      [class*="close-button"], [class*="CloseButton"] {
+        display: none !important;
+        opacity: 0 !important;
+        visibility: hidden !important;
+      }
+    `;
+    // Also inject into iframes
+    document.querySelectorAll('iframe').forEach(f => {
+      try {
+        if (!f.contentDocument) return;
+        let iStyle = f.contentDocument.getElementById('ff-hide-icloud');
+        if (!iStyle) {
+          iStyle = f.contentDocument.createElement('style');
+          iStyle.id = 'ff-hide-icloud';
+          f.contentDocument.head.appendChild(iStyle);
+        }
+        iStyle.textContent = style.textContent;
+      } catch (e) {}
+    });
+  }
+
+  function showICloudChrome() {
+    const style = document.getElementById('ff-hide-icloud');
+    if (style) style.textContent = '';
+    document.querySelectorAll('iframe').forEach(f => {
+      try {
+        const iStyle = f.contentDocument.getElementById('ff-hide-icloud');
+        if (iStyle) iStyle.textContent = '';
+      } catch (e) {}
+    });
+  }
+
   async function captureScreenshot() {
+    hideiCloudChrome();
+    await new Promise(r => setTimeout(r, 100)); // repaint
     const resp = await sendMessage({ type: 'CAPTURE_TAB' });
+    showICloudChrome();
     if (!resp || !resp.dataUrl) return null;
 
     // Crop the screenshot to remove iCloud UI (top bar, bottom carousel)
