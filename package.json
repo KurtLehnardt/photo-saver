@@ -1,0 +1,17 @@
+{
+  "name": "frameflow",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted photo/video slideshow for iPad, reading from Apple Photos library",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "sharp": "^0.33.0"
+  }
+}
