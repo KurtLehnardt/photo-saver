@@ -62,8 +62,49 @@
     return match ? match[1] : null;
   }
 
+  // Canvas for capturing blob-sourced images
+  const captureCanvas = document.createElement('canvas');
+  const captureCtx = captureCanvas.getContext('2d');
+  const seenBlobUrls = new Set(); // track which blob URLs we've already captured
+
+  // Capture an img element's pixel data via canvas → object URL
+  function captureImage(img) {
+    try {
+      const w = img.naturalWidth;
+      const h = img.naturalHeight;
+      if (w < MIN_PHOTO_SIZE || h < MIN_PHOTO_SIZE) return null;
+
+      // Cap size to avoid huge canvases
+      const maxDim = 2048;
+      let dw = w, dh = h;
+      if (w > maxDim || h > maxDim) {
+        const scale = maxDim / Math.max(w, h);
+        dw = Math.round(w * scale);
+        dh = Math.round(h * scale);
+      }
+
+      captureCanvas.width = dw;
+      captureCanvas.height = dh;
+      captureCtx.drawImage(img, 0, 0, dw, dh);
+
+      // Create a blob URL from the canvas (more memory efficient than data URL)
+      return new Promise(resolve => {
+        captureCanvas.toBlob(blob => {
+          if (blob) {
+            resolve(URL.createObjectURL(blob));
+          } else {
+            resolve(null);
+          }
+        }, 'image/jpeg', 0.92);
+      });
+    } catch (e) {
+      // Canvas tainted or other error
+      return null;
+    }
+  }
+
   // Scrape currently visible photos and ADD them to the persistent set
-  function scrapeAndCollect() {
+  async function scrapeAndCollect() {
     const before = collectedUrls.size;
 
     // Collect from all accessible documents (main + iframes)
@@ -77,17 +118,35 @@
     } catch (e) {}
 
     for (const doc of docs) {
-      // All <img> elements
-      doc.querySelectorAll('img').forEach(img => {
+      // Strategy 1: Capture blob-sourced images via canvas
+      const imgs = doc.querySelectorAll('img');
+      for (const img of imgs) {
         const src = img.src || '';
-        if (isExcluded(src)) return;
-        // Size check — skip if we know it's tiny
-        if (img.naturalWidth > 0 && img.naturalWidth < MIN_PHOTO_SIZE) return;
-        if (img.naturalHeight > 0 && img.naturalHeight < MIN_PHOTO_SIZE) return;
-        collectedUrls.add(src);
-      });
 
-      // Background images (inline style)
+        // For blob URLs: capture the pixel data since we can't reuse the blob
+        if (src.startsWith('blob:')) {
+          if (seenBlobUrls.has(src)) continue;
+          if (img.naturalWidth < MIN_PHOTO_SIZE || img.naturalHeight < MIN_PHOTO_SIZE) continue;
+          if (!img.complete) continue;
+
+          seenBlobUrls.add(src);
+          try {
+            const captured = await captureImage(img);
+            if (captured) {
+              collectedUrls.add(captured);
+            }
+          } catch (e) {}
+          continue;
+        }
+
+        // For regular URLs: collect directly
+        if (isExcluded(src)) continue;
+        if (img.naturalWidth > 0 && img.naturalWidth < MIN_PHOTO_SIZE) continue;
+        if (img.naturalHeight > 0 && img.naturalHeight < MIN_PHOTO_SIZE) continue;
+        collectedUrls.add(src);
+      }
+
+      // Strategy 2: Background images (inline style)
       doc.querySelectorAll('[style*="background"]').forEach(el => {
         const url = extractBgUrl(el.getAttribute('style') || '');
         if (url && !isExcluded(url)) {
@@ -98,7 +157,7 @@
         }
       });
 
-      // Computed background images on photo-like elements
+      // Strategy 3: Computed background images
       doc.querySelectorAll('div, figure, li, a, span').forEach(el => {
         const rect = el.getBoundingClientRect();
         if (rect.width < MIN_PHOTO_SIZE || rect.height < MIN_PHOTO_SIZE) return;
@@ -114,9 +173,8 @@
 
     const added = collectedUrls.size - before;
     if (added > 0) {
-      // Rebuild the array
       photoUrls = Array.from(collectedUrls);
-      console.log('[FrameFlow] +' + added + ' new photos (total: ' + photoUrls.length + ')');
+      console.log('[FrameFlow] +' + added + ' new photos captured (total: ' + photoUrls.length + ')');
     }
 
     return added;
@@ -125,11 +183,21 @@
   // ===== MutationObserver — continuously capture photos as iCloud renders them =====
   let scrapeTimeout = null;
 
+  let isCollecting = false;
+
+  async function debouncedCollect() {
+    if (isCollecting) return;
+    isCollecting = true;
+    try {
+      await scrapeAndCollect();
+    } catch (e) {}
+    isCollecting = false;
+  }
+
   function startObserving() {
-    // Debounced scrape on DOM changes
     const observer = new MutationObserver(() => {
       clearTimeout(scrapeTimeout);
-      scrapeTimeout = setTimeout(scrapeAndCollect, 300);
+      scrapeTimeout = setTimeout(debouncedCollect, 500);
     });
 
     // Observe main document
@@ -144,8 +212,8 @@
       } catch (e) {}
     });
 
-    // Also poll periodically as a fallback (some changes don't trigger mutations)
-    setInterval(scrapeAndCollect, 2000);
+    // Also poll periodically as a fallback
+    setInterval(debouncedCollect, 2000);
 
     return observer;
   }
@@ -203,7 +271,7 @@
 
     isScrolling = true;
 
-    scrollInterval = setInterval(() => {
+    async function scrollTick() {
       if (!isScrolling) {
         clearInterval(scrollInterval);
         onComplete();
@@ -214,8 +282,9 @@
       container.scrollTop += container.clientHeight * 0.8;
       window.scrollBy(0, window.innerHeight * 0.8);
 
-      // Scrape
-      scrapeAndCollect();
+      // Wait a moment for images to render, then scrape
+      await new Promise(r => setTimeout(r, 300));
+      await scrapeAndCollect();
 
       const currentCount = collectedUrls.size;
       if (currentCount > lastCount) {
@@ -226,13 +295,14 @@
       }
       lastCount = currentCount;
 
-      // Done?
       if (staleRounds >= maxStaleRounds) {
         isScrolling = false;
         clearInterval(scrollInterval);
         onComplete();
       }
-    }, 1000);
+    }
+
+    scrollInterval = setInterval(scrollTick, 1500);
   }
 
   function stopScrolling() {
@@ -570,9 +640,10 @@
   });
 
   // ===== Initialize =====
-  // Start observing and collecting immediately
   console.log('[FrameFlow] Content script loaded on', window.location.href);
-  scrapeAndCollect();
+  scrapeAndCollect().then(() => {
+    console.log('[FrameFlow] Initial scrape complete:', collectedUrls.size, 'photos');
+  });
   startObserving();
 
 })();
