@@ -82,6 +82,23 @@ PHOTOS_LIBRARY=/path/to/my/photos npm start
 
 macOS may ask for permission to access your Photos library. Grant **Full Disk Access** to your Terminal app in System Preferences → Privacy & Security → Full Disk Access.
 
+## Deploy to Vercel
+
+> **Note:** When deployed to Vercel, only Google Photos source is available (no local filesystem access). The local Photos library source only works when self-hosted.
+
+1. Install Vercel CLI: `npm i -g vercel`
+2. Set environment variables:
+   ```bash
+   vercel env add GOOGLE_CLIENT_ID
+   vercel env add GOOGLE_CLIENT_SECRET
+   ```
+3. Add your Vercel deployment URL as an authorized redirect URI in Google Cloud Console:
+   `https://your-app.vercel.app/api/google/callback`
+4. Deploy:
+   ```bash
+   vercel --prod
+   ```
+
 ## License
 
 MIT

@@ -83,3 +83,6 @@ start().catch(err => {
   console.error('Failed to start:', err);
   process.exit(1);
 });
+
+// Export for Vercel serverless
+module.exports = app;
