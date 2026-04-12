@@ -736,43 +736,43 @@
 
   let errCount = 0;
   function loadSlide(idx) {
-    if (idx < 0 || idx >= mediaItems.length) return;
+    if (idx < 0 || idx >= photoUrls.length) return;
     if (errCount >= 10) { showStatus('Many items failed to load.'); errCount = 0; return; }
-    const item = mediaItems[idx];
-    if (brokenUrls.has(item.url)) { errCount++; setTimeout(showNext, 50); return; }
+
+    const url = photoUrls[idx];
+    const item = mediaItems[idx]; // may have type info
+    const isVideo = item && item.type === 'video';
+
+    if (brokenUrls.has(url)) { errCount++; setTimeout(showNext, 50); return; }
     const layer = getInactive();
     if (!layer) return;
     clearLayer(layer);
     currentIndex = idx;
     if (settings.fill === 'cover') layer.classList.add('ff-fill-cover');
 
-    if (item.type === 'video') {
+    if (isVideo) {
       const video = document.createElement('video');
       video.autoplay = true;
       video.playsInline = true;
       video.setAttribute('playsinline', '');
       video.setAttribute('autoplay', '');
-      // Start muted to guarantee autoplay, unmute after playing starts
       video.muted = true;
       video.setAttribute('muted', '');
-      video.onplaying = () => {
-        if (!isMuted) { video.muted = false; }
-      };
+      video.onplaying = () => { if (!isMuted) video.muted = false; };
       video.onloadeddata = () => {
         errCount = 0;
         swapLayers();
-        // Explicitly try to play in case autoplay didn't fire
         video.play().catch(() => {});
       };
       video.onended = () => { showNext(); };
-      video.onerror = () => { brokenUrls.add(item.url); errCount++; setTimeout(showNext, 200); };
-      video.src = item.url;
+      video.onerror = () => { brokenUrls.add(url); errCount++; setTimeout(showNext, 200); };
+      video.src = url;
       layer.appendChild(video);
     } else {
       const img = document.createElement('img');
       img.onload = () => { errCount = 0; applyKenBurns(layer); swapLayers(); scheduleNext(); };
-      img.onerror = () => { brokenUrls.add(item.url); errCount++; setTimeout(showNext, 200); };
-      img.src = item.url;
+      img.onerror = () => { brokenUrls.add(url); errCount++; setTimeout(showNext, 200); };
+      img.src = url;
       layer.appendChild(img);
     }
   }
