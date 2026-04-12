@@ -1,8 +1,28 @@
+// Simple .env loader (no dependency needed)
+const envPath = require('path').join(__dirname, '.env');
+try {
+  const envFile = require('fs').readFileSync(envPath, 'utf8');
+  envFile.split('\n').forEach(line => {
+    line = line.trim();
+    if (line && !line.startsWith('#')) {
+      const eqIndex = line.indexOf('=');
+      if (eqIndex > 0) {
+        const key = line.substring(0, eqIndex).trim();
+        const value = line.substring(eqIndex + 1).trim();
+        if (!process.env[key]) {
+          process.env[key] = value;
+        }
+      }
+    }
+  });
+} catch (e) { /* no .env file, that's fine */ }
+
 const express = require('express');
 const path = require('path');
 const os = require('os');
 const { router: apiRouter, loadMedia } = require('./routes/api');
 const media = require('./lib/media');
+const googleRoutes = require('./routes/google');
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
@@ -16,6 +36,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // API routes
 app.use('/api', apiRouter);
+app.use('/api/google', googleRoutes);
 
 // Start server
 async function start() {
