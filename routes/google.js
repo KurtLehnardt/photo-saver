@@ -90,91 +90,107 @@ router.get('/status', (req, res) => {
   const tokens = storeData.googleTokens;
   const hasTokens = !!(tokens && tokens.refreshToken);
   const configured = !!CLIENT_ID;
-  res.json({ authenticated: hasTokens, configured });
+  const hasPickedPhotos = !!(storeData.pickedPhotos && storeData.pickedPhotos.length > 0);
+  res.json({ authenticated: hasTokens, configured, hasPickedPhotos });
 });
 
-// POST /api/google/logout - Clear tokens
+// POST /api/google/logout - Clear tokens and picked photos
 router.post('/logout', (req, res) => {
   const storeData = store.load();
   delete storeData.googleTokens;
-  delete storeData.selectedAlbums;
+  delete storeData.pickedPhotos;
+  delete storeData.pickerSessionId;
   store.save(storeData);
   res.json({ ok: true });
 });
 
-// GET /api/google/albums - List user's albums
-router.get('/albums', ensureAuth, async (req, res) => {
+// POST /api/google/picker - Create a new picker session
+router.post('/picker', ensureAuth, async (req, res) => {
   try {
-    const albums = [];
-    let pageToken = null;
+    const session = await google.createSession(req.accessToken);
+    console.log('[google] Picker session created:', session.id);
 
-    do {
-      const result = await google.listAlbums(req.accessToken, pageToken);
-      if (result.albums) {
-        albums.push(...result.albums.map(a => ({
-          id: a.id,
-          title: a.title,
-          mediaItemsCount: parseInt(a.mediaItemsCount || '0', 10),
-          coverPhotoBaseUrl: a.coverPhotoBaseUrl
-        })));
-      }
-      pageToken = result.nextPageToken || null;
-    } while (pageToken);
-
-    // Include which albums are currently selected
+    // Save session ID
     const storeData = store.load();
-    const selectedIds = storeData.selectedAlbums || [];
+    storeData.pickerSessionId = session.id;
+    store.save(storeData);
 
     res.json({
-      albums: albums.map(a => ({
-        ...a,
-        selected: selectedIds.includes(a.id)
-      }))
+      sessionId: session.id,
+      pickerUri: session.pickerUri,
+      expireTime: session.expireTime
     });
   } catch (err) {
     if (err.message === 'UNAUTHORIZED') {
       return res.status(401).json({ error: 'Token expired' });
     }
-    console.error('[google] List albums error:', err.message);
-    res.status(500).json({ error: 'Failed to list albums' });
+    console.error('[google] Create picker session error:', err.message);
+    res.status(500).json({ error: 'Failed to create picker session' });
   }
 });
 
-// POST /api/google/select-albums - Save selected album IDs
-router.post('/select-albums', express.json(), (req, res) => {
-  const { albumIds } = req.body;
-  if (!Array.isArray(albumIds)) {
-    return res.status(400).json({ error: 'albumIds must be an array' });
+// POST /api/google/picker/done - Poll session and save picked photos
+router.post('/picker/done', ensureAuth, async (req, res) => {
+  try {
+    const storeData = store.load();
+    const sessionId = storeData.pickerSessionId;
+
+    if (!sessionId) {
+      return res.status(400).json({ error: 'No active picker session' });
+    }
+
+    // Check session status
+    const session = await google.getSession(req.accessToken, sessionId);
+    console.log('[google] Session status:', session.mediaItemsSet);
+
+    if (!session.mediaItemsSet) {
+      return res.json({ ready: false, message: 'User has not finished picking photos yet' });
+    }
+
+    // Fetch all picked media items
+    const items = await google.getAllPickedItems(req.accessToken, sessionId);
+    console.log('[google] Picked', items.length, 'media items');
+
+    // Save picked photos to store
+    const pickedPhotos = items.map(item => ({
+      id: item.id,
+      type: item.type || 'PHOTO',
+      baseUrl: item.mediaFile ? item.mediaFile.baseUrl : null,
+      mimeType: item.mediaFile ? item.mediaFile.mimeType : null,
+      filename: item.mediaFile ? item.mediaFile.filename : null
+    }));
+
+    storeData.pickedPhotos = pickedPhotos;
+    store.save(storeData);
+
+    res.json({ ready: true, count: pickedPhotos.length });
+  } catch (err) {
+    if (err.message === 'UNAUTHORIZED') {
+      return res.status(401).json({ error: 'Token expired' });
+    }
+    console.error('[google] Picker done error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch picked photos' });
   }
-
-  const storeData = store.load();
-  storeData.selectedAlbums = albumIds;
-  store.save(storeData);
-
-  res.json({ ok: true, selected: albumIds.length });
 });
 
-// GET /api/google/slides - Get slides from selected albums
+// GET /api/google/slides - Get slides from picked photos
 router.get('/slides', ensureAuth, async (req, res) => {
   try {
     const storeData = store.load();
-    const albumIds = storeData.selectedAlbums || [];
+    const pickedPhotos = storeData.pickedPhotos || [];
     const hiddenIds = storeData.hiddenIds || [];
 
-    if (albumIds.length === 0) {
+    if (pickedPhotos.length === 0) {
       return res.json({ slides: [], total: 0, visible: 0, hidden: 0 });
     }
 
-    const mediaItems = await google.getAllMediaFromAlbums(req.accessToken, albumIds);
-
-    // Filter to photos and videos, exclude hidden
-    const slides = mediaItems
-      .filter(item => !hiddenIds.includes(item.id))
+    // Filter out hidden and build slides
+    const slides = pickedPhotos
+      .filter(item => item.baseUrl && !hiddenIds.includes(item.id))
       .map(item => {
-        const isVideo = item.mediaMetadata && item.mediaMetadata.video;
-        // Google Photos baseUrl requires size parameters to be appended
-        // For images: =w{width}-h{height}
-        // For videos: =dv (download video)
+        const isVideo = item.type === 'VIDEO' ||
+          (item.mimeType && item.mimeType.startsWith('video/'));
+
         let src;
         if (isVideo) {
           src = item.baseUrl + '=dv';
@@ -186,17 +202,15 @@ router.get('/slides', ensureAuth, async (req, res) => {
           id: item.id,
           type: isVideo ? 'video' : 'image',
           src,
-          filename: item.filename,
-          width: item.mediaMetadata ? parseInt(item.mediaMetadata.width, 10) : null,
-          height: item.mediaMetadata ? parseInt(item.mediaMetadata.height, 10) : null
+          filename: item.filename
         };
       });
 
     res.json({
       slides,
-      total: mediaItems.length,
+      total: pickedPhotos.length,
       visible: slides.length,
-      hidden: mediaItems.length - slides.length
+      hidden: pickedPhotos.length - slides.length
     });
   } catch (err) {
     if (err.message === 'UNAUTHORIZED') {

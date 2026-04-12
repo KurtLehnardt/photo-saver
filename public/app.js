@@ -20,7 +20,6 @@
   var isShowingOverlay = false;
   var isShowingControls = false;
   var source = localStorage.getItem('frameflow_source') || null; // 'local' or 'google'
-  var selectedAlbumIds = [];
 
   // DOM refs
   const layerA = document.getElementById('layer-a');
@@ -32,7 +31,6 @@
   const loading = document.getElementById('loading');
   const wakeVideo = document.getElementById('wake-video');
   const sourcePicker = document.getElementById('source-picker');
-  const albumPicker = document.getElementById('album-picker');
 
   // ===== Wake Lock =====
   function acquireWakeLock() {
@@ -597,96 +595,78 @@
           window.location.href = '/api/google/auth';
           return;
         }
+        // If already have picked photos, go straight to slideshow
+        if (status.hasPickedPhotos) {
+          sourcePicker.classList.add('hidden');
+          startSlideshow();
+          return;
+        }
+        // Otherwise open the Google picker
         sourcePicker.classList.add('hidden');
-        showAlbumPicker();
+        openGooglePicker();
       });
     }
   }
 
-  // ===== Album Picker =====
-  function showAlbumPicker() {
-    albumPicker.classList.remove('hidden');
-    var grid = document.getElementById('album-grid');
-    grid.innerHTML = '<div class="loading-text">Loading albums...</div>';
+  // ===== Google Photos Picker =====
+  var pickerWindow = null;
+  var pickerPollTimer = null;
 
-    fetch('/api/google/albums').then(function(res) {
+  function openGooglePicker() {
+    loading.classList.remove('hidden');
+    loading.querySelector('.loading-text').textContent = 'Opening Google Photos picker...';
+
+    fetch('/api/google/picker', { method: 'POST' }).then(function(res) {
       if (res.status === 401) {
         window.location.href = '/api/google/auth';
         return null;
       }
-      if (!res.ok) throw new Error('Failed to load albums');
+      if (!res.ok) throw new Error('Failed to create picker session');
       return res.json();
     }).then(function(data) {
       if (!data) return;
-      grid.innerHTML = '';
 
-      if (data.albums.length === 0) {
-        grid.innerHTML = '<div class="loading-text">No albums found</div>';
-        return;
-      }
+      loading.querySelector('.loading-text').textContent = 'Select photos in the Google picker window, then come back here.';
 
-      selectedAlbumIds = data.albums.filter(function(a) { return a.selected; }).map(function(a) { return a.id; });
-      updateStartButton();
+      // Open Google's picker in a new window/tab
+      pickerWindow = window.open(data.pickerUri, 'google-picker', 'width=800,height=600');
 
-      data.albums.forEach(function(album) {
-        var card = document.createElement('div');
-        card.className = 'album-card' + (album.selected ? ' selected' : '');
-
-        var coverUrl = album.coverPhotoBaseUrl ? album.coverPhotoBaseUrl + '=w300-h300-c' : '';
-
-        card.innerHTML =
-          (coverUrl ? '<img src="' + coverUrl + '" alt="">' : '<div style="width:100%;aspect-ratio:1;background:#222"></div>') +
-          '<div class="album-info">' +
-            '<div class="album-name">' + escapeHtml(album.title) + '</div>' +
-            '<div class="album-count">' + album.mediaItemsCount + ' items</div>' +
-          '</div>' +
-          '<div class="album-check">' + (album.selected ? '\u2713' : '') + '</div>';
-
-        card.addEventListener('click', function() {
-          var idx = selectedAlbumIds.indexOf(album.id);
-          if (idx >= 0) {
-            selectedAlbumIds.splice(idx, 1);
-            card.classList.remove('selected');
-            card.querySelector('.album-check').textContent = '';
-          } else {
-            selectedAlbumIds.push(album.id);
-            card.classList.add('selected');
-            card.querySelector('.album-check').textContent = '\u2713';
-          }
-          updateStartButton();
-        });
-
-        grid.appendChild(card);
-      });
+      // Poll for completion
+      pollPickerSession();
     }).catch(function(err) {
-      grid.innerHTML = '<div class="loading-text">Failed to load albums</div>';
-      console.error('[app] Album load error:', err);
+      console.error('[app] Picker error:', err);
+      loading.querySelector('.loading-text').textContent = 'Failed to open picker. Tap to retry.';
+      loading.addEventListener('click', function retry() {
+        loading.removeEventListener('click', retry);
+        openGooglePicker();
+      }, { once: true });
     });
   }
 
-  function updateStartButton() {
-    var btn = document.getElementById('btn-start-show');
-    btn.disabled = selectedAlbumIds.length === 0;
-    btn.textContent = selectedAlbumIds.length > 0
-      ? 'Start Slideshow (' + selectedAlbumIds.length + ' albums)'
-      : 'Select albums to start';
-  }
+  function pollPickerSession() {
+    clearTimeout(pickerPollTimer);
 
-  function startSlideshowFromAlbums() {
-    fetch('/api/google/select-albums', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ albumIds: selectedAlbumIds })
-    }).then(function() {
-      albumPicker.classList.add('hidden');
-      startSlideshow();
+    fetch('/api/google/picker/done', { method: 'POST' }).then(function(res) {
+      if (!res.ok) throw new Error('Poll failed');
+      return res.json();
+    }).then(function(data) {
+      if (data.ready) {
+        // Photos picked successfully
+        if (pickerWindow && !pickerWindow.closed) {
+          pickerWindow.close();
+        }
+        pickerWindow = null;
+        console.log('[app] Picked ' + data.count + ' photos');
+        startSlideshow();
+      } else {
+        // Not done yet, poll again in 2 seconds
+        pickerPollTimer = setTimeout(pollPickerSession, 2000);
+      }
+    }).catch(function(err) {
+      console.warn('[app] Picker poll error:', err.message);
+      // Keep polling — user might still be picking
+      pickerPollTimer = setTimeout(pollPickerSession, 3000);
     });
-  }
-
-  function escapeHtml(str) {
-    var div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
   }
 
   // ===== Start Slideshow (shared between sources) =====
@@ -739,30 +719,18 @@
       return;
     }
 
-    // If google source, check auth and go to album picker or slideshow
+    // If google source, check auth and start slideshow or pick photos
     if (source === 'google') {
       checkGoogleStatus().then(function(status) {
         if (!status.authenticated) {
           showSourcePicker();
           return;
         }
-        // Check if albums are already selected
-        var albumsStarted = false;
-        return fetch('/api/google/albums').then(function(res) {
-          if (res.ok) {
-            return res.json().then(function(data) {
-              var hasSelected = data.albums.some(function(a) { return a.selected; });
-              if (hasSelected) {
-                albumsStarted = true;
-                return startSlideshow();
-              }
-            });
-          }
-        }).catch(function() {}).then(function() {
-          if (!albumsStarted) {
-            showAlbumPicker();
-          }
-        });
+        if (status.hasPickedPhotos) {
+          startSlideshow();
+        } else {
+          openGooglePicker();
+        }
       });
       return;
     }
@@ -775,15 +743,15 @@
   document.getElementById('src-local').addEventListener('click', function() { selectSource('local'); });
   document.getElementById('src-google').addEventListener('click', function() { selectSource('google'); });
 
-  // Album picker buttons
-  document.getElementById('btn-back-source').addEventListener('click', function() {
-    albumPicker.classList.add('hidden');
-    source = null;
-    localStorage.removeItem('frameflow_source');
-    showSourcePicker();
-  });
-
-  document.getElementById('btn-start-show').addEventListener('click', function() { startSlideshowFromAlbums(); });
+  // Pick new photos button (in settings, only visible for Google source)
+  var btnPickPhotos = document.getElementById('btn-pick-photos');
+  if (btnPickPhotos) {
+    btnPickPhotos.addEventListener('click', function() {
+      settingsPanel.classList.add('hidden');
+      clearTimeout(timer);
+      openGooglePicker();
+    });
+  }
 
   // Change source button
   document.getElementById('btn-change-source').addEventListener('click', function() {
