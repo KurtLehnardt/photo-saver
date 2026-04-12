@@ -10,9 +10,13 @@
   console.log('[FrameFlow]', isTop ? 'TOP' : 'IFRAME', window.location.href.substring(0, 60));
 
   // ================================================================
-  // IFRAME INSTANCE — find photo thumbnails and report positions
+  // IFRAME INSTANCE — capture photos directly (same-origin as blobs)
   // ================================================================
   if (!isTop) {
+    const iframeCanvas = document.createElement('canvas');
+    const iframeCtx = iframeCanvas.getContext('2d');
+    let lastCapturedSrc = '';
+
     function reportPhotoPositions() {
       const photos = [];
       document.querySelectorAll('img').forEach(img => {
@@ -20,7 +24,6 @@
         if (!img.complete) return;
         const rect = img.getBoundingClientRect();
         if (rect.width < 20 || rect.height < 20) return;
-        if (rect.top < 0 || rect.left < 0) return;
         photos.push({
           x: Math.round(rect.left + rect.width / 2),
           y: Math.round(rect.top + rect.height / 2),
@@ -34,26 +37,84 @@
       if (photos.length > 0) {
         window.top.postMessage({
           type: 'FRAMEFLOW_PHOTO_POSITIONS',
-          photos,
-          iframeSrc: window.location.href
+          photos
         }, '*');
       }
     }
 
-    // Report on load and periodically
+    // Try to capture the largest image and send it as a data URL to top frame
+    function capturelargestImage() {
+      let best = null, bestSize = 0;
+      document.querySelectorAll('img').forEach(img => {
+        if (!img.complete) return;
+        const size = img.naturalWidth * img.naturalHeight;
+        if (size > bestSize) { bestSize = size; best = img; }
+      });
+
+      if (!best || best.naturalWidth < 100 || best.naturalHeight < 100) return;
+
+      const src = best.src || '';
+      // Only capture if this is a new/different image
+      const key = src + '_' + best.naturalWidth + 'x' + best.naturalHeight;
+      if (key === lastCapturedSrc) return;
+
+      try {
+        const maxDim = 4096;
+        let w = best.naturalWidth, h = best.naturalHeight;
+        if (w > maxDim || h > maxDim) {
+          const s = maxDim / Math.max(w, h);
+          w = Math.round(w * s); h = Math.round(h * s);
+        }
+        iframeCanvas.width = w;
+        iframeCanvas.height = h;
+        iframeCtx.drawImage(best, 0, 0, w, h);
+
+        // Convert to data URL — this works because we're same-origin with the blob
+        const dataUrl = iframeCanvas.toDataURL('image/jpeg', 0.95);
+        if (dataUrl && dataUrl.length > 1000) {
+          lastCapturedSrc = key;
+          window.top.postMessage({
+            type: 'FRAMEFLOW_PHOTO_DATA',
+            dataUrl,
+            width: best.naturalWidth,
+            height: best.naturalHeight
+          }, '*');
+          console.log('[FrameFlow/iframe] Captured', best.naturalWidth + 'x' + best.naturalHeight, 'image');
+        }
+      } catch (e) {
+        // Still tainted? Log but don't spam
+        if (!capturelargestImage._logged) {
+          console.log('[FrameFlow/iframe] Canvas capture failed:', e.message);
+          capturelargestImage._logged = true;
+        }
+      }
+    }
+
+    // Listen for capture requests from top frame
+    window.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'FRAMEFLOW_REQUEST_CAPTURE') {
+        capturelargestImage();
+      }
+    });
+
+    // Report positions and try to capture periodically
     reportPhotoPositions();
     setInterval(reportPhotoPositions, 3000);
+    setInterval(capturelargestImage, 1000);
 
     // Report on DOM changes
     const obs = new MutationObserver(() => {
       clearTimeout(obs._t);
-      obs._t = setTimeout(reportPhotoPositions, 500);
+      obs._t = setTimeout(() => {
+        reportPhotoPositions();
+        capturelargestImage();
+      }, 500);
     });
     if (document.body) {
       obs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
     }
 
-    return; // iframe instance done
+    return;
   }
 
   // ================================================================
@@ -73,34 +134,59 @@
   let activeLayer = 'a';
   let viewHistory = [], historyPos = -1;
 
-  // Photo positions reported by iframe instances
+  // Photo positions and data reported by iframe instances
   let iframePhotoPositions = [];
   let iframeElement = null;
+  let iframeSource = null; // the iframe's contentWindow for sending messages back
+  let pendingPhotoResolve = null; // resolve function for waiting on a photo capture
+  let iframeCanCapture = false; // whether the iframe can capture (same-origin)
 
   window.addEventListener('message', (e) => {
-    if (e.data && e.data.type === 'FRAMEFLOW_PHOTO_POSITIONS') {
-      // Find which iframe this came from to get its viewport offset
+    if (!e.data) return;
+
+    if (e.data.type === 'FRAMEFLOW_PHOTO_POSITIONS') {
       document.querySelectorAll('iframe').forEach(f => {
-        try {
-          if (f.contentWindow === e.source) {
-            iframeElement = f;
-          }
-        } catch (err) {}
+        try { if (f.contentWindow === e.source) { iframeElement = f; iframeSource = e.source; } } catch (err) {}
       });
 
       const iframeRect = iframeElement ? iframeElement.getBoundingClientRect() : { left: 0, top: 0 };
-
-      // Convert iframe-relative positions to page-level positions
       iframePhotoPositions = e.data.photos.map(p => ({
-        x: p.x + iframeRect.left,
-        y: p.y + iframeRect.top,
-        w: p.w, h: p.h,
-        rectW: p.rectW, rectH: p.rectH
+        x: p.x + iframeRect.left, y: p.y + iframeRect.top,
+        w: p.w, h: p.h, rectW: p.rectW, rectH: p.rectH
       }));
-
       console.log('[FrameFlow] Received', iframePhotoPositions.length, 'photo positions from iframe');
     }
+
+    if (e.data.type === 'FRAMEFLOW_PHOTO_DATA') {
+      // Iframe successfully captured an image!
+      iframeCanCapture = true;
+      console.log('[FrameFlow] Received photo data from iframe:', e.data.width + 'x' + e.data.height);
+
+      if (pendingPhotoResolve) {
+        pendingPhotoResolve(e.data.dataUrl);
+        pendingPhotoResolve = null;
+      } else {
+        // Unsolicited capture (from periodic scanning) — add to collection
+        collectedUrls.add(e.data.dataUrl);
+        photoUrls = Array.from(collectedUrls);
+      }
+    }
   });
+
+  // Request a photo capture from the iframe (returns a promise)
+  function requestIframeCapture(timeoutMs) {
+    return new Promise(resolve => {
+      if (!iframeSource) { resolve(null); return; }
+      iframeSource.postMessage({ type: 'FRAMEFLOW_REQUEST_CAPTURE' }, '*');
+      pendingPhotoResolve = resolve;
+      setTimeout(() => {
+        if (pendingPhotoResolve === resolve) {
+          pendingPhotoResolve = null;
+          resolve(null);
+        }
+      }, timeoutMs || 3000);
+    });
+  }
 
   function saveExtSettings() {
     chrome.storage.local.set({ frameflow_settings: settings });
@@ -243,7 +329,6 @@
 
     // The actual capture loop (runs after user opens a photo)
     async function startCapture() {
-      // Wait a moment for the full-res image to load
       await new Promise(r => setTimeout(r, 1500));
 
       let captured = 0;
@@ -259,13 +344,16 @@
       async function step() {
         if (!isRunning || captured >= maxTarget) { finish(); return; }
 
-        // Hide our progress indicator before screenshot
-        progressDiv.style.display = 'none';
-        await new Promise(r => setTimeout(r, 150));
+        // Try iframe capture first (direct image data, no UI chrome)
+        let dataUrl = await requestIframeCapture(2000);
 
-        const dataUrl = await captureScreenshot();
-
-        progressDiv.style.display = '';
+        // Fallback to screenshot if iframe can't capture
+        if (!dataUrl) {
+          progressDiv.style.display = 'none';
+          await new Promise(r => setTimeout(r, 150));
+          dataUrl = await captureScreenshot();
+          progressDiv.style.display = '';
+        }
 
         if (dataUrl && dataUrl !== lastDataUrl) {
           lastDataUrl = dataUrl;
@@ -275,6 +363,9 @@
           progressDiv.textContent = 'Capturing ' + captured + ' / ' + maxTarget;
           onProgress(captured);
           photoUrls = Array.from(collectedUrls);
+
+          const method = iframeCanCapture ? 'direct capture' : 'screenshot';
+          console.log('[FrameFlow] #' + captured + ' via ' + method);
         } else {
           staleCount++;
         }
@@ -283,7 +374,6 @@
 
         // Advance to next photo via debugger
         await sendRealKey('ArrowRight');
-        // Wait for next photo to load
         await new Promise(r => setTimeout(r, 2000));
         scrollTimer = setTimeout(step, 100);
       }
