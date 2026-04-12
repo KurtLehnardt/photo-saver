@@ -120,194 +120,172 @@
     return added;
   }
 
-  // ===== Hi-Res: Click through iCloud detail view =====
-  function sendKey(key, targetEl) {
-    const opts = { key, code: key, bubbles: true, cancelable: true };
-    const el = targetEl || document.activeElement || document.body;
-    el.dispatchEvent(new KeyboardEvent('keydown', opts));
-    el.dispatchEvent(new KeyboardEvent('keyup', opts));
+  // ===== Hi-Res: Automated click + screenshot approach =====
+  // Uses chrome.debugger via background script for:
+  // 1. Real mouse clicks (to open photo detail view)
+  // 2. Real keyboard events (to navigate between photos)
+  // 3. Tab screenshots (to capture the full-res rendered photo)
+
+  function sendMessage(msg) {
+    return new Promise(resolve => {
+      chrome.runtime.sendMessage(msg, response => {
+        if (chrome.runtime.lastError) {
+          console.warn('[FrameFlow] sendMessage error:', chrome.runtime.lastError.message);
+          resolve(null);
+        } else {
+          resolve(response);
+        }
+      });
+    });
   }
 
-  function getAllDocs() {
-    const docs = [document];
-    document.querySelectorAll('iframe').forEach(f => {
-      try { if (f.contentDocument) docs.push(f.contentDocument); } catch (e) {}
-    });
-    return docs;
+  async function captureScreenshot() {
+    const resp = await sendMessage({ type: 'CAPTURE_TAB' });
+    return resp ? resp.dataUrl : null;
+  }
+
+  async function sendRealKey(key) {
+    return sendMessage({ type: 'SEND_KEY', key });
+  }
+
+  async function sendRealClick(x, y) {
+    return sendMessage({ type: 'CLICK_AT', x, y });
   }
 
   async function loadHiResPhotos(target, onProgress, onDone) {
-    const maxTarget = target || 500;
+    const maxTarget = target || 10;
     console.log('[FrameFlow] Hi-res mode: target', maxTarget, 'photos');
     const overlay = document.getElementById('frameflow-overlay');
 
-    // Hide overlay to interact with iCloud
+    // Hide our overlay so iCloud is visible for screenshots
     if (overlay) overlay.style.display = 'none';
-    await new Promise(r => setTimeout(r, 800));
+    await new Promise(r => setTimeout(r, 500));
 
-    // Try multiple strategies to click a photo
-    let clicked = false;
-    const docs = getAllDocs();
-
-    for (const doc of docs) {
-      if (clicked) break;
-
-      // Strategy 1: Find img with blob src and click its ancestors
-      for (const img of doc.querySelectorAll('img')) {
-        if (img.naturalWidth < 30 || img.naturalHeight < 30) continue;
-        const src = img.src || '';
-        if (!src.startsWith('blob:') && isExcluded(src)) continue;
-
-        // Try clicking progressively up the DOM tree
-        let el = img;
-        for (let depth = 0; depth < 5 && el; depth++) {
-          console.log('[FrameFlow] Trying click on', el.tagName, el.className ? '.' + el.className.substring(0, 30) : '');
-          el.click();
-          // Also try synthetic mouse events
-          el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-          el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-          el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-
-          await new Promise(r => setTimeout(r, 800));
-
-          // Check if detail view opened (look for a much larger image)
-          let foundLarger = false;
-          for (const d of docs) {
-            for (const bigImg of d.querySelectorAll('img')) {
-              if (bigImg.complete && bigImg.naturalWidth > 400 && bigImg.naturalHeight > 400) {
-                foundLarger = true; break;
-              }
-            }
-            if (foundLarger) break;
-          }
-
-          if (foundLarger) {
-            console.log('[FrameFlow] Detail view opened!');
-            clicked = true;
-            break;
-          }
-          el = el.parentElement;
-        }
-        if (clicked) break;
-      }
-
-      // Strategy 2: Double-click
-      if (!clicked) {
-        for (const img of doc.querySelectorAll('img')) {
-          if (img.naturalWidth < 30) continue;
-          const src = img.src || '';
-          if (!src.startsWith('blob:') && isExcluded(src)) continue;
-          img.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
-          await new Promise(r => setTimeout(r, 1000));
-
-          let foundLarger = false;
-          for (const d of docs) {
-            for (const bigImg of d.querySelectorAll('img')) {
-              if (bigImg.complete && bigImg.naturalWidth > 400) { foundLarger = true; break; }
-            }
-            if (foundLarger) break;
-          }
-          if (foundLarger) { clicked = true; console.log('[FrameFlow] Detail view opened via dblclick!'); break; }
-        }
+    // Find the first photo thumbnail and click it via debugger
+    // Look for img elements and get their screen coordinates
+    let clickTarget = null;
+    const allImgs = document.querySelectorAll('img');
+    for (const img of allImgs) {
+      if (img.naturalWidth < 30 || img.naturalHeight < 30) continue;
+      const src = img.src || '';
+      if (!src.startsWith('blob:') && isExcluded(src)) continue;
+      const rect = img.getBoundingClientRect();
+      if (rect.width > 20 && rect.height > 20 && rect.top > 0 && rect.left > 0) {
+        clickTarget = { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+        console.log('[FrameFlow] Found photo at', clickTarget.x, clickTarget.y, '(' + img.naturalWidth + 'x' + img.naturalHeight + ')');
+        break;
       }
     }
 
-    if (!clicked) {
-      console.log('[FrameFlow] Could not open detail view. Falling back to thumbnail mode.');
+    // Also check iframes
+    if (!clickTarget) {
+      document.querySelectorAll('iframe').forEach(iframe => {
+        try {
+          if (!iframe.contentDocument || clickTarget) return;
+          for (const img of iframe.contentDocument.querySelectorAll('img')) {
+            if (img.naturalWidth < 30) continue;
+            const src = img.src || '';
+            if (!src.startsWith('blob:') && isExcluded(src)) continue;
+            // Get coordinates relative to viewport (accounting for iframe position)
+            const iframeRect = iframe.getBoundingClientRect();
+            const imgRect = img.getBoundingClientRect();
+            clickTarget = {
+              x: Math.round(iframeRect.left + imgRect.left + imgRect.width / 2),
+              y: Math.round(iframeRect.top + imgRect.top + imgRect.height / 2)
+            };
+            console.log('[FrameFlow] Found photo in iframe at', clickTarget.x, clickTarget.y);
+            break;
+          }
+        } catch (e) {}
+      });
+    }
+
+    if (!clickTarget) {
+      console.log('[FrameFlow] No clickable photo found');
       if (overlay) overlay.style.display = '';
-      showStatus('Hi-res: could not open photo detail view. Using thumbnails.');
+      showStatus('No photos found to click. Try scrolling first.');
       onDone();
       return;
     }
 
-    await new Promise(r => setTimeout(r, 1500));
+    // Click the photo via chrome.debugger (real click that iCloud responds to)
+    console.log('[FrameFlow] Clicking photo at', clickTarget.x, clickTarget.y);
+    const clickResult = await sendRealClick(clickTarget.x, clickTarget.y);
+    if (!clickResult || !clickResult.ok) {
+      console.log('[FrameFlow] Click failed, trying double click');
+      await sendRealClick(clickTarget.x, clickTarget.y);
+    }
 
-    // Now capture photos from detail view
+    // Wait for detail view to load
+    await new Promise(r => setTimeout(r, 2500));
+
+    // Now capture screenshots and advance
     let captured = 0;
-    let lastCapturedSize = '';
+    let lastScreenshot = null;
     let staleCount = 0;
 
-    // Use a separate set for hi-res captures (don't mix with thumbnail URLs)
-    const hiResUrls = new Set();
+    // Show a small progress indicator
+    const progressDiv = document.createElement('div');
+    progressDiv.id = 'ff-hires-progress';
+    progressDiv.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:999999;background:rgba(0,0,0,0.8);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);padding:12px 24px;border-radius:10px;font-family:-apple-system,sans-serif;color:#fff;font-size:14px;pointer-events:none;';
+    progressDiv.textContent = 'Capturing 0 / ' + maxTarget + '...';
+    document.body.appendChild(progressDiv);
 
-    async function captureAndAdvance() {
+    async function captureStep() {
       if (!isRunning || captured >= maxTarget) {
-        closeAndFinish();
+        finishCapture();
         return;
       }
 
-      // Find the largest image (detail view photo)
-      let bestImg = null, bestSize = 0;
-      for (const doc of getAllDocs()) {
-        for (const img of doc.querySelectorAll('img')) {
-          if (!img.complete) continue;
-          const size = img.naturalWidth * img.naturalHeight;
-          if (size > bestSize) { bestSize = size; bestImg = img; }
-        }
-      }
+      // Take screenshot
+      const dataUrl = await captureScreenshot();
 
-      if (bestImg && bestImg.naturalWidth >= 200) {
-        const sizeKey = bestImg.naturalWidth + 'x' + bestImg.naturalHeight + '_' + bestImg.src.substring(0, 50);
+      if (dataUrl && dataUrl !== lastScreenshot) {
+        lastScreenshot = dataUrl;
+        collectedUrls.add(dataUrl);
+        captured++;
+        staleCount = 0;
+        progressDiv.textContent = 'Capturing ' + captured + ' / ' + maxTarget + '...';
+        onProgress(captured);
+        console.log('[FrameFlow] Screenshot #' + captured);
 
-        if (sizeKey !== lastCapturedSize) {
-          try {
-            const blobUrl = await captureImage(bestImg, 4096);
-            if (blobUrl) {
-              hiResUrls.add(blobUrl);
-              collectedUrls.add(blobUrl);
-              captured++;
-              lastCapturedSize = sizeKey;
-              staleCount = 0;
-              onProgress(captured);
-              console.log('[FrameFlow] Hi-res #' + captured + ': ' + bestImg.naturalWidth + 'x' + bestImg.naturalHeight);
-            }
-          } catch (e) {
-            console.warn('[FrameFlow] Capture failed:', e.message);
-          }
-        } else {
-          staleCount++;
+        // Start slideshow after a few captures
+        if (currentIndex < 0 && collectedUrls.size >= 2) {
+          photoUrls = Array.from(collectedUrls);
+          buildShuffleOrder();
         }
       } else {
         staleCount++;
       }
 
-      // Navigate to next photo
-      sendKey('ArrowRight');
-      // Also try on iframes
-      for (const doc of getAllDocs()) {
-        if (doc !== document) {
-          try { sendKey('ArrowRight', doc.body || doc.documentElement); } catch (e) {}
-        }
-      }
-
-      await new Promise(r => setTimeout(r, 2000));
-
-      if (staleCount > 8) {
-        console.log('[FrameFlow] Stale after', staleCount, 'rounds. Finishing.');
-        closeAndFinish();
+      if (staleCount > 5) {
+        console.log('[FrameFlow] Stale, finishing capture');
+        finishCapture();
         return;
       }
 
-      scrollTimer = setTimeout(captureAndAdvance, 100);
+      // Send real ArrowRight via debugger to advance to next photo
+      await sendRealKey('ArrowRight');
+
+      // Wait for the photo to load
+      await new Promise(r => setTimeout(r, 2000));
+      scrollTimer = setTimeout(captureStep, 100);
     }
 
-    function closeAndFinish() {
-      sendKey('Escape');
-      for (const doc of getAllDocs()) {
-        if (doc !== document) {
-          try { sendKey('Escape', doc.body || doc.documentElement); } catch (e) {}
-        }
-      }
+    async function finishCapture() {
+      progressDiv.remove();
 
-      setTimeout(() => {
-        if (overlay) overlay.style.display = '';
-        photoUrls = Array.from(collectedUrls);
-        console.log('[FrameFlow] Hi-res complete:', captured, 'of', maxTarget, 'captured');
-        onDone();
-      }, 800);
+      // Close detail view
+      await sendRealKey('Escape');
+      await new Promise(r => setTimeout(r, 500));
+
+      photoUrls = Array.from(collectedUrls);
+      if (overlay) overlay.style.display = '';
+      console.log('[FrameFlow] Hi-res complete:', captured, 'screenshots captured');
+      onDone();
     }
 
-    captureAndAdvance();
+    captureStep();
   }
 
   // ===== Auto-scroll (thumbnail mode) =====
