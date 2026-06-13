@@ -12,6 +12,8 @@
   },
   "dependencies": {
     "express": "^4.21.0",
-    "sharp": "^0.33.0"
+    "js-yaml": "^4.1.0",
+    "sharp": "^0.33.0",
+    "swagger-ui-express": "^5.0.1"
   }
 }

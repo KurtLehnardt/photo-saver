@@ -1,0 +1,653 @@
+openapi: 3.0.3
+
+info:
+  title: FrameFlow API
+  version: 1.0.0
+  description: >
+    FrameFlow is a self-hosted photo and video slideshow server designed for iPad
+    kiosk display. It reads from an Apple Photos library (or Google Photos) and
+    exposes a simple HTTP API for managing slides, settings, and Google OAuth.
+    This reference covers all v1 endpoints.
+
+servers:
+  - url: /v1
+    description: FrameFlow v1 API
+
+tags:
+  - name: slides
+    description: List and filter slides from the local library
+  - name: media
+    description: Serve and hide/unhide individual media files
+  - name: library
+    description: Library scanning operations
+  - name: settings
+    description: Slideshow settings (shuffle, transition, duration, etc.)
+  - name: google
+    description: Google Photos OAuth and picker integration
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # Slides
+  # ---------------------------------------------------------------------------
+
+  /slides:
+    get:
+      operationId: listSlides
+      summary: List visible slides
+      description: Returns all non-hidden media items from the local library as slideshow slides.
+      tags: [slides]
+      responses:
+        "200":
+          description: Slide list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SlideListEnvelope"
+
+  /slides/hidden:
+    get:
+      operationId: listHiddenSlides
+      summary: List hidden slides
+      description: Returns all media items that have been hidden from the slideshow.
+      tags: [slides]
+      responses:
+        "200":
+          description: Hidden slide list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SlideListEnvelope"
+
+  # ---------------------------------------------------------------------------
+  # Media
+  # ---------------------------------------------------------------------------
+
+  /media/{id}:
+    get:
+      operationId: getMedia
+      summary: Serve media file
+      description: >
+        Returns the raw bytes of the media file. Images are converted to JPEG
+        and resized; videos are streamed directly. Supports HTTP Range requests
+        for video seeking. No response envelope — body is the binary content.
+      tags: [media]
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+        - name: Range
+          in: header
+          required: false
+          schema:
+            type: string
+            example: bytes=0-1048576
+          description: Byte range for partial content (video seeking)
+      responses:
+        "200":
+          description: Full media file
+          content:
+            image/jpeg: {}
+            video/mp4: {}
+            video/quicktime: {}
+        "206":
+          description: Partial content (range request)
+          headers:
+            Content-Range:
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                type: string
+          content:
+            video/mp4: {}
+            video/quicktime: {}
+        "404":
+          description: Media not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /media/{id}/hide:
+    post:
+      operationId: hideMedia
+      summary: Hide a media item
+      description: Adds the media item to the hidden list so it no longer appears in slides.
+      tags: [media]
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+      responses:
+        "200":
+          description: Item hidden
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          hiddenCount:
+                            type: integer
+                            description: Total number of hidden items after this operation
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+
+  /media/{id}/unhide:
+    post:
+      operationId: unhideMedia
+      summary: Unhide a media item
+      description: Removes the media item from the hidden list so it reappears in slides.
+      tags: [media]
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+      responses:
+        "200":
+          description: Item unhidden
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          hiddenCount:
+                            type: integer
+                            description: Total number of hidden items after this operation
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+
+  # ---------------------------------------------------------------------------
+  # Library
+  # ---------------------------------------------------------------------------
+
+  /library/rescan:
+    post:
+      operationId: rescanLibrary
+      summary: Trigger library rescan
+      description: Re-scans the photos library directory and updates the in-memory media list.
+      tags: [library]
+      responses:
+        "200":
+          description: Rescan complete
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [previous, current, added, lastScan]
+                        properties:
+                          previous:
+                            type: integer
+                            description: Media count before rescan
+                          current:
+                            type: integer
+                            description: Media count after rescan
+                          added:
+                            type: integer
+                            description: Net new items discovered
+                          lastScan:
+                            type: integer
+                            nullable: true
+                            description: Unix timestamp (ms) of scan completion
+
+  # ---------------------------------------------------------------------------
+  # Settings
+  # ---------------------------------------------------------------------------
+
+  /settings:
+    get:
+      operationId: getSettings
+      summary: Get slideshow settings
+      description: Returns the current slideshow configuration.
+      tags: [settings]
+      responses:
+        "200":
+          description: Current settings
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/Settings"
+
+    patch:
+      operationId: updateSettings
+      summary: Update slideshow settings (partial)
+      description: Merges the provided fields into the current settings. Any omitted fields keep their existing values.
+      tags: [settings]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Settings"
+      responses:
+        "200":
+          description: Updated settings
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/Settings"
+        "400":
+          $ref: "#/components/responses/InvalidInput"
+
+  # ---------------------------------------------------------------------------
+  # Health
+  # ---------------------------------------------------------------------------
+
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Health check
+      description: Returns server health and basic library stats.
+      tags: [library]
+      responses:
+        "200":
+          description: Health status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/HealthStatus"
+
+  # ---------------------------------------------------------------------------
+  # Google OAuth
+  # ---------------------------------------------------------------------------
+
+  /google/auth:
+    get:
+      operationId: googleAuth
+      summary: Start Google OAuth flow
+      description: Redirects the browser to Google's OAuth consent screen. Not a JSON endpoint.
+      tags: [google]
+      responses:
+        "302":
+          description: Redirect to Google OAuth
+          headers:
+            Location:
+              schema:
+                type: string
+        "500":
+          $ref: "#/components/responses/NotConfigured"
+
+  /google/callback:
+    get:
+      operationId: googleCallback
+      summary: Google OAuth callback
+      description: >
+        Receives the OAuth authorization code from Google, exchanges it for tokens,
+        saves them, then redirects to `/?source=google` on success or
+        `/?error=<message>` on failure.
+      tags: [google]
+      parameters:
+        - name: code
+          in: query
+          schema:
+            type: string
+          description: Authorization code from Google
+        - name: error
+          in: query
+          schema:
+            type: string
+          description: Error code if the user denied access
+      responses:
+        "302":
+          description: Redirect to app root
+          headers:
+            Location:
+              schema:
+                type: string
+
+  /google/status:
+    get:
+      operationId: googleStatus
+      summary: Google auth status
+      description: Returns whether the server is authenticated with Google and whether photos have been picked.
+      tags: [google]
+      responses:
+        "200":
+          description: Auth status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/GoogleStatus"
+
+  /google/logout:
+    post:
+      operationId: googleLogout
+      summary: Clear Google tokens
+      description: Deletes stored Google tokens and picked photos from the server state.
+      tags: [google]
+      responses:
+        "200":
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          ok:
+                            type: boolean
+                            example: true
+
+  /google/picker:
+    post:
+      operationId: createPickerSession
+      summary: Create Google Photos picker session
+      description: Creates a new Photos Picker API session. The returned `pickerUri` should be opened in the browser for the user to select photos.
+      tags: [google]
+      responses:
+        "200":
+          description: Picker session created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/PickerSession"
+        "401":
+          $ref: "#/components/responses/NotAuthenticated"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /google/picker/done:
+    post:
+      operationId: pickerDone
+      summary: Poll picker session completion
+      description: Checks whether the user has finished picking photos. Call repeatedly until `ready` is `true`.
+      tags: [google]
+      responses:
+        "200":
+          description: Picker status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/PickerDoneResponse"
+        "400":
+          description: No active picker session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "#/components/responses/NotAuthenticated"
+
+  /google/slides:
+    get:
+      operationId: googleSlides
+      summary: Get Google Photos slides
+      description: Returns slides from the user's picked Google Photos, excluding any hidden items.
+      tags: [google]
+      responses:
+        "200":
+          description: Slide list from Google Photos
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SlideListEnvelope"
+        "401":
+          $ref: "#/components/responses/NotAuthenticated"
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+
+components:
+
+  parameters:
+    MediaId:
+      name: id
+      in: path
+      required: true
+      description: Opaque media item ID (SHA-256 hex prefix)
+      schema:
+        type: string
+        example: a3f9c1b2e5d74082
+
+  responses:
+    InvalidInput:
+      description: Invalid input
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    NotAuthenticated:
+      description: Not authenticated with Google
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    NotConfigured:
+      description: Google OAuth not configured on server
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+  schemas:
+
+    Slide:
+      type: object
+      required: [id, type, src, filename]
+      properties:
+        id:
+          type: string
+          description: Opaque media item ID
+          example: a3f9c1b2e5d74082
+        type:
+          type: string
+          enum: [image, video]
+          description: Media type
+        src:
+          type: string
+          description: URL to fetch the media bytes
+          example: /v1/media/a3f9c1b2e5d74082
+        filename:
+          type: string
+          description: Original filename
+          example: IMG_4291.HEIC
+
+    SlideList:
+      type: object
+      required: [slides, total, visible, hidden]
+      properties:
+        slides:
+          type: array
+          items:
+            $ref: "#/components/schemas/Slide"
+        total:
+          type: integer
+          description: Total media items in library
+        visible:
+          type: integer
+          description: Number of visible (non-hidden) items
+        hidden:
+          type: integer
+          description: Number of hidden items
+
+    SlideListEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/SlideList"
+        error:
+          nullable: true
+          example: null
+
+    Settings:
+      type: object
+      properties:
+        shuffle:
+          type: boolean
+          description: Randomize slide order
+          example: false
+        transition:
+          type: string
+          description: Transition effect between slides
+          example: fade
+        fill:
+          type: string
+          description: CSS object-fit mode for images
+          enum: [contain, cover]
+          example: contain
+        kenBurns:
+          type: boolean
+          description: Enable slow pan/zoom effect on images
+          example: true
+        muted:
+          type: boolean
+          description: Mute video audio
+          example: false
+        duration:
+          type: integer
+          description: Seconds each image slide is displayed
+          example: 8
+        paused:
+          type: boolean
+          description: Pause the slideshow
+          example: false
+
+    HealthStatus:
+      type: object
+      required: [ok, slides, hidden, lastScan]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        slides:
+          type: integer
+          description: Number of media items currently loaded
+          example: 142
+        hidden:
+          type: integer
+          description: Number of hidden items
+          example: 3
+        lastScan:
+          type: integer
+          nullable: true
+          description: Unix timestamp (ms) of last library scan
+          example: 1718200000000
+
+    GoogleStatus:
+      type: object
+      required: [authenticated, configured, hasPickedPhotos]
+      properties:
+        authenticated:
+          type: boolean
+          description: Whether valid Google OAuth tokens are stored
+        configured:
+          type: boolean
+          description: Whether GOOGLE_CLIENT_ID is set on the server
+        hasPickedPhotos:
+          type: boolean
+          description: Whether the user has picked photos in a prior session
+
+    PickerSession:
+      type: object
+      required: [sessionId, pickerUri, expireTime]
+      properties:
+        sessionId:
+          type: string
+          description: Opaque session ID from Google Photos Picker API
+        pickerUri:
+          type: string
+          description: URL to open in the browser for photo selection
+        expireTime:
+          type: string
+          description: ISO 8601 expiration time of the session
+
+    PickerDoneResponse:
+      type: object
+      required: [ready]
+      properties:
+        ready:
+          type: boolean
+          description: Whether the user has finished picking photos
+        count:
+          type: integer
+          description: Number of picked photos (present when ready=true)
+        message:
+          type: string
+          description: Human-readable status message (present when ready=false)
+
+    ErrorResponse:
+      type: object
+      required: [message, code]
+      properties:
+        message:
+          type: string
+          description: Human-readable error description
+        code:
+          type: string
+          description: Machine-readable error code
+          enum:
+            - NOT_FOUND
+            - INVALID_INPUT
+            - NOT_AUTHENTICATED
+            - NOT_CONFIGURED
+            - INTERNAL_ERROR
+            - NO_PICKER_SESSION
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        data:
+          nullable: true
+          example: null
+        error:
+          $ref: "#/components/schemas/ErrorResponse"
+
+    SuccessEnvelope:
+      type: object
+      properties:
+        data:
+          type: object
+          description: Endpoint-specific response payload
+        error:
+          nullable: true
+          example: null

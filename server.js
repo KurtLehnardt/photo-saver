@@ -19,8 +19,12 @@ try {
 
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 const os = require('os');
+const yaml = require('js-yaml');
+const swaggerUi = require('swagger-ui-express');
 const { router: apiRouter, loadMedia } = require('./routes/api');
+const { router: v1Router, loadMedia: loadMediaV1 } = require('./routes/v1');
 const media = require('./lib/media');
 const googleRoutes = require('./routes/google');
 
@@ -31,10 +35,17 @@ const HOST = '0.0.0.0';
 const LIBRARY_PATH = process.env.PHOTOS_LIBRARY ||
   path.join(os.homedir(), 'Pictures', 'Photos Library.photoslibrary', 'originals');
 
+// Load OpenAPI spec
+const swaggerDoc = yaml.load(fs.readFileSync(path.join(__dirname, 'docs', 'openapi.yaml'), 'utf8'));
+
 // Serve static frontend
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Swagger UI
+app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDoc));
+
 // API routes
+app.use('/v1', v1Router);
 app.use('/api', apiRouter);
 app.use('/api/google', googleRoutes);
 
@@ -46,8 +57,9 @@ async function start() {
   console.log(`  Photos library: ${LIBRARY_PATH}`);
   console.log('');
 
-  // Initial scan
+  // Initial scan (both routers maintain independent in-memory lists)
   const items = loadMedia(LIBRARY_PATH);
+  loadMediaV1(LIBRARY_PATH);
   console.log(`  Found ${items.length} media files`);
   console.log('');
 
