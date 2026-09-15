@@ -701,7 +701,10 @@
       async function step() {
         if (!isRunning || captured >= target) { finish(captured); return; }
 
-        const mediaInfo = await requestMediaType(1500);
+        // stopSlideshow() settles in-flight requests with null to unblock this
+        // loop, so every awaited result here has to tolerate null.
+        const mediaInfo = (await requestMediaType(1500)) || { mediaType: 'photo' };
+        if (!isRunning) { finish(captured); return; }
 
         if (mediaInfo.mediaType === 'video') {
           progress('Recording video ' + (captured + 1) + ' / ' + targetLabel(target) + '...');
@@ -763,7 +766,7 @@
         }
 
         // 8 consecutive no-new-media rounds means we hit the end of the library
-        if (staleCount > 8) { finish(captured); return; }
+        if (!isRunning || staleCount > 8) { finish(captured); return; }
 
         const keyOk = await sendRealKey('ArrowRight');
         if (keyOk) {
@@ -778,10 +781,22 @@
           return;
         }
         await new Promise(r => setTimeout(r, 2000));
-        scrollTimer = setTimeout(step, 100);
+        scrollTimer = setTimeout(runStep, 100);
       }
 
+      async function runStep() {
+        try {
+          await step();
+        } catch (e) {
+          console.warn('[FrameFlow] Capture aborted:', e && e.message);
+          finish(captured);
+        }
+      }
+
+      let finished = false;
       async function finish(count) {
+        if (finished) return;
+        finished = true;
         if (progressDiv.isConnected) progressDiv.remove();
 
         // Stay in capture mode until the closing Escape has landed — handleKeydown
@@ -812,7 +827,7 @@
         onDone();
       }
 
-      step();
+      runStep();
     }
   }
 
