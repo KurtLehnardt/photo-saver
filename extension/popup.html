@@ -102,6 +102,12 @@
       transition: transform 0.2s;
     }
     .setting input[type="checkbox"]:checked::after { transform: translateX(16px); }
+    .note {
+      font-size: 11px;
+      color: rgba(255,255,255,0.4);
+      margin-bottom: 12px;
+      line-height: 1.4;
+    }
     .range-wrap {
       display: flex;
       align-items: center;
@@ -141,12 +147,9 @@
       <option value="0">All (slow)</option>
     </select>
   </div>
-  <div class="setting" style="margin-bottom:12px">
-    <span>Hi-Res Mode</span>
-    <input type="checkbox" id="set-hires">
-  </div>
-  <div id="hires-note" style="font-size:11px;color:rgba(255,255,255,0.4);margin-bottom:12px;display:none">
-    You'll click one photo to open it, then FrameFlow auto-captures the rest at full resolution.
+  <div class="note">
+    After you press Start, click one photo to open it &mdash; FrameFlow then
+    auto-captures the rest at full resolution.
   </div>
 
   <button id="btn-start">Start Slideshow</button>

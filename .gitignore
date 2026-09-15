@@ -5,3 +5,4 @@ data/store.json
 .DS_Store
 *.log
 .vercel
+.claude/worktrees/
