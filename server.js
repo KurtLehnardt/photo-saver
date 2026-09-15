@@ -38,6 +38,14 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use('/api', apiRouter);
 app.use('/api/google', googleRoutes);
 
+// Scan the library into memory. Runs in both self-hosted and serverless mode —
+// on Vercel there is no local Photos library, so this finds nothing and only the
+// Google Photos source is usable.
+function scanLibrary() {
+  const items = loadMedia(LIBRARY_PATH);
+  return items;
+}
+
 // Start server
 async function start() {
   console.log('');
@@ -46,8 +54,7 @@ async function start() {
   console.log(`  Photos library: ${LIBRARY_PATH}`);
   console.log('');
 
-  // Initial scan
-  const items = loadMedia(LIBRARY_PATH);
+  const items = scanLibrary();
   console.log(`  Found ${items.length} media files`);
   console.log('');
 
@@ -79,10 +86,16 @@ async function start() {
   });
 }
 
-start().catch(err => {
-  console.error('Failed to start:', err);
-  process.exit(1);
-});
+// Only bind a port when run directly (`npm start`). Under Vercel this module is
+// imported as a serverless handler, where calling app.listen() is wrong.
+if (require.main === module) {
+  start().catch(err => {
+    console.error('Failed to start:', err);
+    process.exit(1);
+  });
+} else {
+  scanLibrary();
+}
 
 // Export for Vercel serverless
 module.exports = app;

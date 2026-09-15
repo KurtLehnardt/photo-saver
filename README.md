@@ -1,6 +1,13 @@
 # FrameFlow
 
-Self-hosted photo slideshow server for turning an old iPad into a digital photo frame. Reads directly from your macOS Apple Photos library.
+Two ways to put your photos on a screen:
+
+- **[Server](#setup)** — self-hosted slideshow for turning an old iPad into a
+  digital photo frame, reading directly from your macOS Apple Photos library.
+- **[Chrome extension](extension/README.md)** — turns `icloud.com/photos` into a
+  full-screen slideshow in the browser. No server, no Photos library.
+
+The two are independent; the rest of this file covers the server.
 
 ## Features
 
@@ -84,7 +91,14 @@ macOS may ask for permission to access your Photos library. Grant **Full Disk Ac
 
 ## Deploy to Vercel
 
-> **Note:** When deployed to Vercel, only Google Photos source is available (no local filesystem access). The local Photos library source only works when self-hosted.
+> **Note:** Vercel runs this as a serverless function, which means:
+> - No local filesystem access, so the Apple Photos library source is unavailable
+>   — only the Google Photos source works.
+> - `data/store.json` and `data/cache/` live on an ephemeral filesystem, so
+>   hidden-photo state and converted images do **not** persist between
+>   invocations. Hiding a photo will not stick.
+>
+> For a real photo frame, self-host it.
 
 1. Install Vercel CLI: `npm i -g vercel`
 2. Set environment variables:

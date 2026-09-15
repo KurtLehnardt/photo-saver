@@ -1,13 +1,22 @@
 // FrameFlow Content Script for icloud.com/photos
 // Runs in ALL frames via manifest all_frames:true.
-// - Iframe instances: find photo positions, report to top frame
-// - Top frame instance: overlay, slideshow, hi-res capture via debugger
+// - Iframe instances: report photo positions, capture photos/videos on request
+// - Top frame instance: overlay, slideshow, capture orchestration
 
 (function() {
   'use strict';
 
   const isTop = (window === window.top);
+  // The manifest only matches https://www.icloud.com/*, so every FrameFlow frame
+  // — top or nested — is on this exact origin.
+  const ORIGIN = 'https://www.icloud.com';
+
   console.log('[FrameFlow]', isTop ? 'TOP' : 'IFRAME', window.location.href.substring(0, 60));
+
+  function isTrusted(e) {
+    return e.origin === ORIGIN && e.data && typeof e.data.type === 'string' &&
+      e.data.type.indexOf('FRAMEFLOW_') === 0;
+  }
 
   // ================================================================
   // IFRAME INSTANCE — capture photos directly (same-origin as blobs)
@@ -15,9 +24,21 @@
   if (!isTop) {
     const iframeCanvas = document.createElement('canvas');
     const iframeCtx = iframeCanvas.getContext('2d');
-    let lastCapturedSrc = '';
+    let lastCapturedKey = '';
+    let isRecording = false;
+    let captureLogged = false;
+
+    // Photo payloads go to the top frame only — never targetOrigin '*', which
+    // would hand full-resolution image data to iCloud's own page scripts.
+    function postToTop(msg, transfer) {
+      try {
+        if (transfer) window.top.postMessage(msg, ORIGIN, transfer);
+        else window.top.postMessage(msg, ORIGIN);
+      } catch (e) { /* top frame gone */ }
+    }
 
     function reportPhotoPositions() {
+      if (document.hidden) return;
       const photos = [];
       document.querySelectorAll('img').forEach(img => {
         if (img.naturalWidth < 30 || img.naturalHeight < 30) return;
@@ -34,91 +55,104 @@
         });
       });
 
-      if (photos.length > 0) {
-        window.top.postMessage({
-          type: 'FRAMEFLOW_PHOTO_POSITIONS',
-          photos
-        }, '*');
-      }
+      if (photos.length > 0) postToTop({ type: 'FRAMEFLOW_PHOTO_POSITIONS', photos });
     }
 
-    // Try to capture the largest image and send it as a data URL to top frame
-    function capturelargestImage() {
+    function findLargestImage() {
       let best = null, bestSize = 0;
       document.querySelectorAll('img').forEach(img => {
         if (!img.complete) return;
         const size = img.naturalWidth * img.naturalHeight;
         if (size > bestSize) { bestSize = size; best = img; }
       });
-
-      if (!best || best.naturalWidth < 100 || best.naturalHeight < 100) return;
-
-      const src = best.src || '';
-      // Only capture if this is a new/different image
-      const key = src + '_' + best.naturalWidth + 'x' + best.naturalHeight;
-      if (key === lastCapturedSrc) return;
-
-      try {
-        const maxDim = 4096;
-        let w = best.naturalWidth, h = best.naturalHeight;
-        if (w > maxDim || h > maxDim) {
-          const s = maxDim / Math.max(w, h);
-          w = Math.round(w * s); h = Math.round(h * s);
-        }
-        iframeCanvas.width = w;
-        iframeCanvas.height = h;
-        iframeCtx.drawImage(best, 0, 0, w, h);
-
-        // Convert to data URL — this works because we're same-origin with the blob
-        const dataUrl = iframeCanvas.toDataURL('image/jpeg', 0.95);
-        if (dataUrl && dataUrl.length > 1000) {
-          lastCapturedSrc = key;
-          window.top.postMessage({
-            type: 'FRAMEFLOW_PHOTO_DATA',
-            dataUrl,
-            width: best.naturalWidth,
-            height: best.naturalHeight
-          }, '*');
-          console.log('[FrameFlow/iframe] Captured', best.naturalWidth + 'x' + best.naturalHeight, 'image');
-        }
-      } catch (e) {
-        // Still tainted? Log but don't spam
-        if (!capturelargestImage._logged) {
-          console.log('[FrameFlow/iframe] Canvas capture failed:', e.message);
-          capturelargestImage._logged = true;
-        }
-      }
+      if (!best || best.naturalWidth < 100 || best.naturalHeight < 100) return null;
+      return best;
     }
 
-    // ===== Video detection and recording =====
-    let isRecording = false;
+    // Draw the largest image to a canvas and return a data URL. Works because the
+    // iframe is same-origin with iCloud's blob-backed <img> elements.
+    function encodeImage(img) {
+      const maxDim = 4096;
+      let w = img.naturalWidth, h = img.naturalHeight;
+      if (w > maxDim || h > maxDim) {
+        const s = maxDim / Math.max(w, h);
+        w = Math.round(w * s); h = Math.round(h * s);
+      }
+      iframeCanvas.width = w;
+      iframeCanvas.height = h;
+      iframeCtx.drawImage(img, 0, 0, w, h);
+      return iframeCanvas.toDataURL('image/jpeg', 0.95);
+    }
 
-    function detectMedia() {
-      // Check if the current detail view shows a video
+    // Poll until a *new* image shows up (iCloud swaps the <img> asynchronously
+    // after an arrow key), then respond. Always answers, so the top frame's
+    // request never has to rely on a timeout to make progress.
+    function captureLargestImage(requestId, deadlineMs) {
+      const deadline = Date.now() + (deadlineMs || 1500);
+
+      function attempt() {
+        const best = findLargestImage();
+        if (best) {
+          const key = (best.src || '') + '_' + best.naturalWidth + 'x' + best.naturalHeight;
+          if (key !== lastCapturedKey) {
+            try {
+              const dataUrl = encodeImage(best);
+              if (dataUrl && dataUrl.length > 1000) {
+                lastCapturedKey = key;
+                postToTop({
+                  type: 'FRAMEFLOW_PHOTO_DATA',
+                  requestId,
+                  dataUrl,
+                  width: best.naturalWidth,
+                  height: best.naturalHeight
+                });
+                console.log('[FrameFlow/iframe] Captured', best.naturalWidth + 'x' + best.naturalHeight, 'image');
+                return;
+              }
+            } catch (e) {
+              if (!captureLogged) {
+                console.log('[FrameFlow/iframe] Canvas capture failed:', e.message);
+                captureLogged = true;
+              }
+              postToTop({ type: 'FRAMEFLOW_PHOTO_DATA', requestId, dataUrl: null });
+              return;
+            }
+          }
+        }
+
+        if (Date.now() < deadline) { setTimeout(attempt, 200); return; }
+        postToTop({ type: 'FRAMEFLOW_PHOTO_DATA', requestId, dataUrl: null });
+      }
+
+      attempt();
+    }
+
+    function detectMedia(requestId) {
       const videos = document.querySelectorAll('video');
       let bestVideo = null;
       for (const v of videos) {
-        if (v.videoWidth > 100 && v.videoHeight > 100) {
-          bestVideo = v;
-          break;
-        }
+        if (v.videoWidth > 100 && v.videoHeight > 100) { bestVideo = v; break; }
       }
 
       if (bestVideo) {
-        window.top.postMessage({
+        postToTop({
           type: 'FRAMEFLOW_MEDIA_TYPE',
+          requestId,
           mediaType: 'video',
           duration: bestVideo.duration || 0,
           width: bestVideo.videoWidth,
           height: bestVideo.videoHeight
-        }, '*');
+        });
       } else {
-        window.top.postMessage({ type: 'FRAMEFLOW_MEDIA_TYPE', mediaType: 'photo' }, '*');
+        postToTop({ type: 'FRAMEFLOW_MEDIA_TYPE', requestId, mediaType: 'photo' });
       }
     }
 
-    async function recordVideo() {
-      if (isRecording) return;
+    async function recordVideo(requestId) {
+      if (isRecording) {
+        postToTop({ type: 'FRAMEFLOW_VIDEO_DATA', requestId, data: null, error: 'Already recording' });
+        return;
+      }
 
       const videos = document.querySelectorAll('video');
       let video = null;
@@ -127,22 +161,21 @@
       }
 
       if (!video) {
-        window.top.postMessage({ type: 'FRAMEFLOW_VIDEO_DATA', data: null, error: 'No video found' }, '*');
+        postToTop({ type: 'FRAMEFLOW_VIDEO_DATA', requestId, data: null, error: 'No video found' });
         return;
       }
 
       isRecording = true;
       console.log('[FrameFlow/iframe] Recording video', video.videoWidth + 'x' + video.videoHeight, 'duration:', video.duration);
 
+      let maxTimer = null;
+
       try {
-        // Ensure video is playing from the start
         video.currentTime = 0;
         video.play().catch(() => {});
 
-        // Get stream from video element
         const stream = video.captureStream();
 
-        // Pick best supported codec
         const codecs = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
         let mimeType = 'video/webm';
         for (const c of codecs) {
@@ -158,76 +191,82 @@
 
         recorder.onstop = async () => {
           isRecording = false;
+          clearTimeout(maxTimer);
           const blob = new Blob(chunks, { type: mimeType });
           console.log('[FrameFlow/iframe] Video recorded:', (blob.size / 1024 / 1024).toFixed(1) + 'MB');
 
-          // Convert to ArrayBuffer and send to top frame
           const buffer = await blob.arrayBuffer();
-          window.top.postMessage({
+          postToTop({
             type: 'FRAMEFLOW_VIDEO_DATA',
+            requestId,
             data: buffer,
             mimeType,
             duration: video.duration,
             width: video.videoWidth,
             height: video.videoHeight
-          }, '*', [buffer]); // transfer, don't copy
+          }, [buffer]); // transfer, don't copy
         };
 
         recorder.onerror = () => {
           isRecording = false;
-          window.top.postMessage({ type: 'FRAMEFLOW_VIDEO_DATA', data: null, error: 'Recording failed' }, '*');
+          clearTimeout(maxTimer);
+          postToTop({ type: 'FRAMEFLOW_VIDEO_DATA', requestId, data: null, error: 'Recording failed' });
         };
 
         recorder.start();
 
-        // Stop when video ends or after max duration
         const maxDuration = Math.min((video.duration || 60) + 2, 120) * 1000;
 
         const stopRecording = () => {
-          if (recorder.state === 'recording') {
-            recorder.stop();
-          }
+          if (recorder.state === 'recording') recorder.stop();
         };
 
         video.addEventListener('ended', stopRecording, { once: true });
-        setTimeout(() => {
+        maxTimer = setTimeout(() => {
           video.removeEventListener('ended', stopRecording);
           stopRecording();
         }, maxDuration);
 
       } catch (e) {
         isRecording = false;
+        clearTimeout(maxTimer);
         console.warn('[FrameFlow/iframe] Video capture failed:', e.message);
-        window.top.postMessage({ type: 'FRAMEFLOW_VIDEO_DATA', data: null, error: e.message }, '*');
+        postToTop({ type: 'FRAMEFLOW_VIDEO_DATA', requestId, data: null, error: e.message });
       }
     }
 
-    // Listen for capture requests from top frame
+    // Fallback when chrome.debugger is unavailable (DevTools holding the tab, or
+    // the permission revoked). Untrusted events, so iCloud may ignore them.
+    function synthKey(key) {
+      const init = { key, code: key, bubbles: true, cancelable: true };
+      const target = document.activeElement || document.body;
+      if (!target) return;
+      target.dispatchEvent(new KeyboardEvent('keydown', init));
+      target.dispatchEvent(new KeyboardEvent('keyup', init));
+    }
+
     window.addEventListener('message', (e) => {
-      if (!e.data) return;
-      if (e.data.type === 'FRAMEFLOW_REQUEST_CAPTURE') {
-        capturelargestImage();
-      }
-      if (e.data.type === 'FRAMEFLOW_DETECT_MEDIA') {
-        detectMedia();
-      }
-      if (e.data.type === 'FRAMEFLOW_REQUEST_VIDEO_CAPTURE') {
-        recordVideo();
-      }
+      if (!isTrusted(e)) return;
+      const d = e.data;
+      if (d.type === 'FRAMEFLOW_REQUEST_CAPTURE') captureLargestImage(d.requestId, d.deadline);
+      else if (d.type === 'FRAMEFLOW_DETECT_MEDIA') detectMedia(d.requestId);
+      else if (d.type === 'FRAMEFLOW_REQUEST_VIDEO_CAPTURE') recordVideo(d.requestId);
+      else if (d.type === 'FRAMEFLOW_RESET_CAPTURE') lastCapturedKey = '';
+      else if (d.type === 'FRAMEFLOW_SYNTH_KEY') synthKey(d.key);
     });
 
-    // Report positions and try to capture periodically
+    // Position reporting is the only always-on work: one querySelectorAll every
+    // 5s, skipped while the tab is hidden. Image encoding happens on request.
+    // Images are usually not decoded yet at document_idle, so re-report a few
+    // times early — otherwise the popup shows "0 photos detected" for 5s.
     reportPhotoPositions();
-    setInterval(reportPhotoPositions, 3000);
-    setInterval(capturelargestImage, 1000);
+    [400, 1200, 2500].forEach(ms => setTimeout(reportPhotoPositions, ms));
+    window.addEventListener('load', reportPhotoPositions);
+    setInterval(reportPhotoPositions, 5000);
 
-    // Report on DOM changes
     const obs = new MutationObserver(() => {
       clearTimeout(obs._t);
-      obs._t = setTimeout(() => {
-        reportPhotoPositions();
-        capturelargestImage();
-      }, 500);
+      obs._t = setTimeout(reportPhotoPositions, 500);
     });
     if (document.body) {
       obs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
@@ -241,18 +280,32 @@
   // ================================================================
 
   // Media items: array of { type: 'photo'|'video', url: string }
+  const MAX_MEDIA = 2000; // hard cap so an "All" run can't grow without bound
   const collectedMedia = [];
-  const collectedUrlSet = new Set(); // dedup
+  const collectedUrlSet = new Set();
   const hiddenUrls = new Set();
   const brokenUrls = new Set();
   let mediaItems = []; // filtered (non-hidden) items for slideshow
-  // Backward compat alias
-  let photoUrls = [];
+  let photoUrls = [];  // urls of mediaItems, same order
+
+  function revokeIfBlob(url) {
+    if (typeof url === 'string' && url.startsWith('blob:')) {
+      try { URL.revokeObjectURL(url); } catch (e) {}
+    }
+  }
 
   function addMedia(type, url) {
+    // Never revoke on a dedup hit: an already-collected item is using that URL.
     if (collectedUrlSet.has(url)) return false;
     collectedUrlSet.add(url);
     collectedMedia.push({ type, url });
+    while (collectedMedia.length > MAX_MEDIA) {
+      const dropped = collectedMedia.shift();
+      collectedUrlSet.delete(dropped.url);
+      hiddenUrls.delete(dropped.url);
+      brokenUrls.delete(dropped.url);
+      revokeIfBlob(dropped.url);
+    }
     return true;
   }
 
@@ -262,118 +315,168 @@
     return photoUrls;
   }
 
+  // Indices in viewHistory/shuffledOrder point into photoUrls, so any change to
+  // the visible set invalidates them.
+  function resetPlaybackIndices() {
+    viewHistory = [];
+    historyPos = -1;
+    currentIndex = -1;
+    buildShuffleOrder();
+  }
+
+  function releaseAllMedia() {
+    collectedMedia.forEach(m => revokeIfBlob(m.url));
+    collectedMedia.length = 0;
+    collectedUrlSet.clear();
+    mediaItems = [];
+    photoUrls = [];
+  }
+
+  window.addEventListener('pagehide', releaseAllMedia);
+
   let isMuted = false;
-  let isRunning = false, isPaused = false;
+  let isRunning = false, isPaused = false, isCapturing = false;
   let settings = {
     shuffle: true, transition: 'fade', fill: 'contain',
-    kenBurns: true, duration: 8, targetPhotos: 500, hiRes: false
+    kenBurns: true, duration: 8, targetPhotos: 100
   };
   let slideTimer = null, controlsTimer = null, scrollTimer = null;
+  let waitTimer = null, videoTimer = null;
   let currentIndex = -1, shuffledOrder = [], shuffleIndex = 0;
   let activeLayer = 'a';
   let viewHistory = [], historyPos = -1;
 
-  // Photo positions and data reported by iframe instances
+  // Persisted settings — the popup also sends these on start, but loading here
+  // keeps the in-page settings panel correct if the slideshow is started any
+  // other way.
+  try {
+    chrome.storage.local.get(['frameflow_settings'], (res) => {
+      if (chrome.runtime.lastError || !res || !res.frameflow_settings) return;
+      Object.assign(settings, res.frameflow_settings);
+      delete settings.hiRes; // removed in 1.2.0 — capture is always hi-res now
+    });
+  } catch (e) {}
+
+  // 0 / "All" means "keep going until the library runs out"
+  function resolveTarget(n) {
+    const v = Number(n);
+    if (!Number.isFinite(v) || v <= 0) return Infinity;
+    return Math.floor(v);
+  }
+  function targetLabel(target) {
+    return target === Infinity ? 'all' : String(target);
+  }
+
+  // Photo positions reported by iframe instances (used for the popup's count)
   let iframePhotoPositions = [];
   let iframeElement = null;
-  let iframeSource = null; // the iframe's contentWindow for sending messages back
-  let pendingPhotoResolve = null;
-  let pendingMediaTypeResolve = null;
-  let pendingVideoResolve = null;
-  let iframeCanCapture = false; // whether the iframe can capture (same-origin)
+
+  // ===== Correlated request/response with iframe instances =====
+  let reqSeq = 0;
+  const pending = new Map(); // requestId -> { resolve, timer }
+
+  function awaitResponse(requestId, timeoutMs, fallback) {
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        pending.delete(requestId);
+        resolve(fallback);
+      }, timeoutMs);
+      pending.set(requestId, { resolve, timer });
+    });
+  }
+
+  function settle(requestId, value) {
+    const p = pending.get(requestId);
+    if (!p) return false;
+    clearTimeout(p.timer);
+    pending.delete(requestId);
+    p.resolve(value);
+    return true;
+  }
+
+  function settleAll(value) {
+    pending.forEach(p => { clearTimeout(p.timer); p.resolve(value); });
+    pending.clear();
+  }
+
+  // Broadcast to every child frame rather than tracking a single "the" iframe —
+  // an iframe that never reported photo positions could otherwise never be asked
+  // to capture. These messages carry no photo data, so '*' is safe here.
+  function postToFrames(msg) {
+    let sent = 0;
+    document.querySelectorAll('iframe').forEach(f => {
+      try {
+        if (f.contentWindow) { f.contentWindow.postMessage(msg, '*'); sent++; }
+      } catch (e) {}
+    });
+    return sent;
+  }
 
   window.addEventListener('message', (e) => {
-    if (!e.data) return;
+    if (!isTrusted(e)) return;
+    const d = e.data;
 
-    if (e.data.type === 'FRAMEFLOW_PHOTO_POSITIONS') {
+    if (d.type === 'FRAMEFLOW_PHOTO_POSITIONS') {
       document.querySelectorAll('iframe').forEach(f => {
-        try { if (f.contentWindow === e.source) { iframeElement = f; iframeSource = e.source; } } catch (err) {}
+        try { if (f.contentWindow === e.source) iframeElement = f; } catch (err) {}
       });
 
       const iframeRect = iframeElement ? iframeElement.getBoundingClientRect() : { left: 0, top: 0 };
-      iframePhotoPositions = e.data.photos.map(p => ({
+      iframePhotoPositions = d.photos.map(p => ({
         x: p.x + iframeRect.left, y: p.y + iframeRect.top,
         w: p.w, h: p.h, rectW: p.rectW, rectH: p.rectH
       }));
-      console.log('[FrameFlow] Received', iframePhotoPositions.length, 'photo positions from iframe');
+      return;
     }
 
-    if (e.data.type === 'FRAMEFLOW_PHOTO_DATA') {
-      iframeCanCapture = true;
-      console.log('[FrameFlow] Received photo data from iframe:', e.data.width + 'x' + e.data.height);
-
-      if (pendingPhotoResolve) {
-        pendingPhotoResolve(e.data.dataUrl);
-        pendingPhotoResolve = null;
-      } else {
-        addMedia('photo', e.data.dataUrl);
-        photoUrls = rebuildPhotoUrls();
-      }
+    if (d.type === 'FRAMEFLOW_PHOTO_DATA') {
+      settle(d.requestId, d.dataUrl || null);
+      return;
     }
 
-    // Media type detection response
-    if (e.data.type === 'FRAMEFLOW_MEDIA_TYPE') {
-      if (pendingMediaTypeResolve) {
-        pendingMediaTypeResolve(e.data);
-        pendingMediaTypeResolve = null;
-      }
+    if (d.type === 'FRAMEFLOW_MEDIA_TYPE') {
+      settle(d.requestId, { mediaType: d.mediaType, duration: d.duration, width: d.width, height: d.height });
+      return;
     }
 
-    // Video recording result
-    if (e.data.type === 'FRAMEFLOW_VIDEO_DATA') {
-      if (e.data.data) {
-        const blob = new Blob([e.data.data], { type: e.data.mimeType || 'video/webm' });
+    if (d.type === 'FRAMEFLOW_VIDEO_DATA') {
+      if (d.data) {
+        const blob = new Blob([d.data], { type: d.mimeType || 'video/webm' });
         const url = URL.createObjectURL(blob);
         addMedia('video', url);
-        photoUrls = rebuildPhotoUrls();
+        rebuildPhotoUrls();
         console.log('[FrameFlow] Received video:', (blob.size / 1024 / 1024).toFixed(1) + 'MB');
       } else {
-        console.warn('[FrameFlow] Video capture failed:', e.data.error);
+        console.warn('[FrameFlow] Video capture failed:', d.error);
       }
-      if (pendingVideoResolve) {
-        pendingVideoResolve(e.data.data ? true : false);
-        pendingVideoResolve = null;
-      }
+      settle(d.requestId, !!d.data);
+      return;
     }
   });
 
-  // Request a photo capture from the iframe (returns a promise)
   function requestIframeCapture(timeoutMs) {
-    return new Promise(resolve => {
-      if (!iframeSource) { resolve(null); return; }
-      iframeSource.postMessage({ type: 'FRAMEFLOW_REQUEST_CAPTURE' }, '*');
-      pendingPhotoResolve = resolve;
-      setTimeout(() => {
-        if (pendingPhotoResolve === resolve) {
-          pendingPhotoResolve = null;
-          resolve(null);
-        }
-      }, timeoutMs || 3000);
-    });
+    const id = 'ff' + (++reqSeq);
+    const ms = timeoutMs || 2500;
+    if (!postToFrames({ type: 'FRAMEFLOW_REQUEST_CAPTURE', requestId: id, deadline: ms - 400 })) {
+      return Promise.resolve(null);
+    }
+    return awaitResponse(id, ms, null);
   }
 
-  // Ask iframe what media type the detail view is showing
   function requestMediaType(timeoutMs) {
-    return new Promise(resolve => {
-      if (!iframeSource) { resolve({ mediaType: 'photo' }); return; }
-      iframeSource.postMessage({ type: 'FRAMEFLOW_DETECT_MEDIA' }, '*');
-      pendingMediaTypeResolve = resolve;
-      setTimeout(() => {
-        if (pendingMediaTypeResolve === resolve) { pendingMediaTypeResolve = null; resolve({ mediaType: 'photo' }); }
-      }, timeoutMs || 2000);
-    });
+    const id = 'ff' + (++reqSeq);
+    if (!postToFrames({ type: 'FRAMEFLOW_DETECT_MEDIA', requestId: id })) {
+      return Promise.resolve({ mediaType: 'photo' });
+    }
+    return awaitResponse(id, timeoutMs || 2000, { mediaType: 'photo' });
   }
 
-  // Ask iframe to record the current video
   function requestVideoCapture(timeoutMs) {
-    return new Promise(resolve => {
-      if (!iframeSource) { resolve(false); return; }
-      iframeSource.postMessage({ type: 'FRAMEFLOW_REQUEST_VIDEO_CAPTURE' }, '*');
-      pendingVideoResolve = resolve;
-      setTimeout(() => {
-        if (pendingVideoResolve === resolve) { pendingVideoResolve = null; resolve(false); }
-      }, timeoutMs || 120000); // up to 2 min for long videos
-    });
+    const id = 'ff' + (++reqSeq);
+    if (!postToFrames({ type: 'FRAMEFLOW_REQUEST_VIDEO_CAPTURE', requestId: id })) {
+      return Promise.resolve(false);
+    }
+    return awaitResponse(id, timeoutMs || 120000, false);
   }
 
   function updateHiddenCount() {
@@ -382,16 +485,18 @@
   }
 
   function saveExtSettings() {
-    chrome.storage.local.set({ frameflow_settings: settings });
+    try { chrome.storage.local.set({ frameflow_settings: settings }); } catch (e) {}
   }
 
-  // ===== Chrome debugger helpers =====
+  // ===== Background worker helpers =====
   function sendMessage(msg) {
     return new Promise(resolve => {
-      chrome.runtime.sendMessage(msg, response => {
-        if (chrome.runtime.lastError) resolve(null);
-        else resolve(response);
-      });
+      try {
+        chrome.runtime.sendMessage(msg, response => {
+          if (chrome.runtime.lastError) resolve(null);
+          else resolve(response);
+        });
+      } catch (e) { resolve(null); }
     });
   }
 
@@ -407,7 +512,6 @@
       style.id = 'ff-hide-icloud';
       document.head.appendChild(style);
     }
-    // Hide known iCloud UI elements that appear over photos
     style.textContent = `
       .OneUp-leadingTopBadges, .OneUp-trailingTopBadges,
       .OneUpBadge, .OneUp-hdrVideoBadge,
@@ -422,10 +526,9 @@
         visibility: hidden !important;
       }
     `;
-    // Also inject into iframes
     document.querySelectorAll('iframe').forEach(f => {
       try {
-        if (!f.contentDocument) return;
+        if (!f.contentDocument || !f.contentDocument.head) return;
         let iStyle = f.contentDocument.getElementById('ff-hide-icloud');
         if (!iStyle) {
           iStyle = f.contentDocument.createElement('style');
@@ -455,7 +558,7 @@
     showICloudChrome();
     if (!resp || !resp.dataUrl) return null;
 
-    // Crop the screenshot to remove iCloud UI (top bar, bottom carousel)
+    // Crop the screenshot to remove iCloud UI (top bar, bottom carousel).
     // iCloud detail view layout:
     //   - Top ~44-60px: navigation/close button bar
     //   - Bottom ~80-120px: thumbnail carousel strip
@@ -466,8 +569,7 @@
         const w = img.naturalWidth;
         const h = img.naturalHeight;
 
-        // Crop percentages (these work for iCloud's detail view layout)
-        const topCrop = Math.round(h * 0.06);    // ~6% from top (nav bar)
+        const topCrop = Math.round(h * 0.06);     // ~6% from top (nav bar)
         const bottomCrop = Math.round(h * 0.12);  // ~12% from bottom (carousel)
         const sideCrop = Math.round(w * 0.02);    // ~2% from sides (minimal)
 
@@ -487,26 +589,29 @@
     });
   }
 
+  // Input.dispatchKeyEvent is delivered to whichever frame has focus. If the user
+  // clicked outside the photo frame, keys land nowhere and iCloud never advances.
+  function focusCaptureFrame() {
+    if (!iframeElement) return;
+    try { iframeElement.focus(); } catch (e) {}
+    try { if (iframeElement.contentWindow) iframeElement.contentWindow.focus(); } catch (e) {}
+  }
+
   async function sendRealKey(key) {
-    return sendMessage({ type: 'SEND_KEY', key });
+    if (isCapturing) focusCaptureFrame();
+    const resp = await sendMessage({ type: 'SEND_KEY', key });
+    if (resp && resp.ok) return true;
+    // chrome.debugger unavailable (DevTools attached, permission denied) —
+    // try an untrusted synthetic event so capture can still limp along.
+    postToFrames({ type: 'FRAMEFLOW_SYNTH_KEY', key });
+    return false;
   }
 
-  async function sendRealClick(x, y) {
-    return sendMessage({ type: 'CLICK_AT', x, y });
-  }
-
-  // ===== Hi-Res Mode =====
-  // User manually opens a photo first (one click), then we capture + auto-advance.
-  async function loadHiResPhotos(target, onProgress, onDone) {
-    const maxTarget = target || 10;
+  // ===== Capture =====
+  // The user manually opens a photo first (one click), then we capture and
+  // auto-advance through the library.
+  function loadHiResPhotos(target, onProgress, onDone) {
     const overlay = document.getElementById('frameflow-overlay');
-
-    // Check if we already have enough cached photos
-    if (collectedMedia.length >= maxTarget) {
-      console.log('[FrameFlow] Using', collectedMedia.length, 'cached photos');
-      onDone();
-      return;
-    }
 
     // Hide overlay and show instructions
     if (overlay) overlay.style.display = 'none';
@@ -518,18 +623,17 @@
     instrDiv.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:999998;background:rgba(0,0,0,0.75);display:flex;align-items:center;justify-content:center;font-family:-apple-system,sans-serif;color:#fff;text-align:center;pointer-events:none;';
     instrDiv.innerHTML = '<div style="max-width:400px;padding:40px;background:rgba(0,0,0,0.85);border-radius:16px;backdrop-filter:blur(20px);pointer-events:auto">' +
       '<div style="font-size:22px;font-weight:700;margin-bottom:12px">Click any photo</div>' +
-      '<div style="font-size:15px;color:rgba(255,255,255,0.6);margin-bottom:20px">Click a photo in iCloud to open it full-size.<br>FrameFlow will then auto-capture ' + maxTarget + ' photos.</div>' +
+      '<div style="font-size:15px;color:rgba(255,255,255,0.6);margin-bottom:20px">Click a photo in iCloud to open it full-size.<br>FrameFlow will then auto-capture ' + targetLabel(target) + ' photos.</div>' +
       '<div style="font-size:13px;color:rgba(255,255,255,0.4)">Waiting for you to open a photo...</div>' +
       '</div>';
     document.body.appendChild(instrDiv);
 
-    // Wait for user to click a photo (detect by watching for a large image to appear)
-    let waitTimeout;
     let checkCount = 0;
 
     function checkForDetailView() {
+      if (!isRunning) { instrDiv.remove(); onDone(); return; }
       checkCount++;
-      // Look across all docs for a large image (detail view)
+
       let found = false;
       const docs = [document];
       document.querySelectorAll('iframe').forEach(f => {
@@ -547,9 +651,7 @@
         if (found) break;
       }
 
-      // Also check if the page layout changed significantly (detail view has different structure)
       if (!found) {
-        // Check for common detail view indicators
         const fullscreenEls = document.querySelectorAll('[class*="detail"], [class*="viewer"], [class*="fullscreen"], [class*="preview"]');
         if (fullscreenEls.length > 0) found = true;
       }
@@ -567,64 +669,73 @@
         return;
       }
 
-      waitTimeout = setTimeout(checkForDetailView, 1000);
+      waitTimer = setTimeout(checkForDetailView, 1000);
     }
 
     checkForDetailView();
 
     // The actual capture loop (runs after user opens a photo)
     async function startCapture() {
+      isCapturing = true;
+      focusCaptureFrame();
+      postToFrames({ type: 'FRAMEFLOW_RESET_CAPTURE' });
+      // One debugger attachment for the whole run — see background.js
+      await sendMessage({ type: 'DEBUGGER_ATTACH' });
       await new Promise(r => setTimeout(r, 1500));
 
       let captured = 0;
       let lastDataUrl = null;
       let staleCount = 0;
+      let keyFailures = 0;
 
       const progressDiv = document.createElement('div');
       progressDiv.id = 'ff-hires-progress';
       progressDiv.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:999999;background:rgba(0,0,0,0.85);backdrop-filter:blur(10px);padding:12px 24px;border-radius:10px;font-family:-apple-system,sans-serif;color:#fff;font-size:14px;pointer-events:none;';
-      progressDiv.textContent = 'Capturing 0 / ' + maxTarget;
+      progressDiv.textContent = 'Capturing 0 / ' + targetLabel(target);
       document.body.appendChild(progressDiv);
 
-      async function step() {
-        if (!isRunning || captured >= maxTarget) { finish(); return; }
+      function progress(text) {
+        if (progressDiv.isConnected) progressDiv.textContent = text;
+      }
 
-        // Detect if this is a video or photo
-        const mediaInfo = await requestMediaType(1500);
+      async function step() {
+        if (!isRunning || captured >= target) { finish(captured); return; }
+
+        // stopSlideshow() settles in-flight requests with null to unblock this
+        // loop, so every awaited result here has to tolerate null.
+        const mediaInfo = (await requestMediaType(1500)) || { mediaType: 'photo' };
+        if (!isRunning) { finish(captured); return; }
 
         if (mediaInfo.mediaType === 'video') {
-          // Record the video
-          progressDiv.textContent = 'Recording video ' + (captured + 1) + ' / ' + maxTarget + '...';
+          progress('Recording video ' + (captured + 1) + ' / ' + targetLabel(target) + '...');
           console.log('[FrameFlow] Video detected, recording... duration:', mediaInfo.duration);
 
           const success = await requestVideoCapture((mediaInfo.duration || 60) * 1000 + 5000);
           if (success) {
             captured++;
             staleCount = 0;
-            progressDiv.textContent = 'Captured ' + captured + ' / ' + maxTarget;
+            progress('Captured ' + captured + ' / ' + targetLabel(target));
             onProgress(captured);
-            photoUrls = rebuildPhotoUrls();
+            rebuildPhotoUrls();
             console.log('[FrameFlow] #' + captured + ' video recorded');
           } else {
             // Video recording failed — capture a screenshot instead
             console.log('[FrameFlow] Video recording failed, capturing screenshot');
-            let dataUrl = await requestIframeCapture(2000);
+            let dataUrl = await requestIframeCapture(2500);
             if (!dataUrl) {
               progressDiv.style.display = 'none';
               await new Promise(r => setTimeout(r, 150));
               dataUrl = await captureScreenshot();
               progressDiv.style.display = '';
             }
-            if (dataUrl) {
-              addMedia('photo', dataUrl);
+            if (dataUrl && addMedia('photo', dataUrl)) {
               captured++;
-              photoUrls = rebuildPhotoUrls();
+              rebuildPhotoUrls();
             }
             staleCount++;
           }
         } else {
-          // Photo — existing capture logic
-          let dataUrl = await requestIframeCapture(2000);
+          let dataUrl = await requestIframeCapture(2500);
           if (!dataUrl) {
             progressDiv.style.display = 'none';
             await new Promise(r => setTimeout(r, 150));
@@ -634,36 +745,74 @@
 
           if (dataUrl && dataUrl !== lastDataUrl) {
             lastDataUrl = dataUrl;
-            addMedia('photo', dataUrl);
-            captured++;
-            staleCount = 0;
-            progressDiv.textContent = 'Capturing ' + captured + ' / ' + maxTarget;
-            onProgress(captured);
-            photoUrls = rebuildPhotoUrls();
-            console.log('[FrameFlow] #' + captured + ' photo captured');
+            // An item we already hold is not progress. Without this, an album
+            // that wraps at the end would capture forever on an unlimited run.
+            if (addMedia('photo', dataUrl)) {
+              captured++;
+              staleCount = 0;
+              progress('Capturing ' + captured + ' / ' + targetLabel(target));
+              onProgress(captured);
+              rebuildPhotoUrls();
+              console.log('[FrameFlow] #' + captured + ' photo captured');
+            } else {
+              staleCount++;
+            }
           } else {
+            // Same image as last round — iCloud hasn't advanced yet. Data URLs
+            // dedupe by value; a blob URL we never collected has to be released.
+            if (dataUrl && !collectedUrlSet.has(dataUrl)) revokeIfBlob(dataUrl);
             staleCount++;
           }
         }
 
-        if (staleCount > 8) { finish(); return; }
+        // 8 consecutive no-new-media rounds means we hit the end of the library
+        if (!isRunning || staleCount > 8) { finish(captured); return; }
 
-        // Advance to next photo via debugger
-        await sendRealKey('ArrowRight');
+        const keyOk = await sendRealKey('ArrowRight');
+        if (keyOk) {
+          keyFailures = 0;
+        } else if (++keyFailures >= 2) {
+          // Without chrome.debugger we cannot advance iCloud, and every further
+          // round would just re-capture the same photo. Stop and say why.
+          console.warn('[FrameFlow] Cannot dispatch keys — aborting capture');
+          progress('Cannot advance photos — close DevTools for this tab and retry');
+          await new Promise(r => setTimeout(r, 2500));
+          finish(captured);
+          return;
+        }
         await new Promise(r => setTimeout(r, 2000));
-        scrollTimer = setTimeout(step, 100);
+        scrollTimer = setTimeout(runStep, 100);
       }
 
-      async function finish() {
-        progressDiv.remove();
-        // Close detail view
+      async function runStep() {
+        try {
+          await step();
+        } catch (e) {
+          console.warn('[FrameFlow] Capture aborted:', e && e.message);
+          finish(captured);
+        }
+      }
+
+      let finished = false;
+      async function finish(count) {
+        if (finished) return;
+        finished = true;
+        if (progressDiv.isConnected) progressDiv.remove();
+
+        // Stay in capture mode until the closing Escape has landed — handleKeydown
+        // is gated on isCapturing, and this Escape would otherwise stop the
+        // slideshow we are about to start.
         await sendRealKey('Escape');
         await new Promise(r => setTimeout(r, 800));
+        await sendMessage({ type: 'DEBUGGER_DETACH' });
+        isCapturing = false;
 
-        photoUrls = rebuildPhotoUrls();
-        console.log('[FrameFlow] Captured', captured, 'photos');
+        rebuildPhotoUrls();
+        console.log('[FrameFlow] Captured', count, 'items');
 
-        // Show overlay and start slideshow
+        // The user may have stopped the slideshow mid-capture — don't resurrect it
+        if (!isRunning) { onDone(); return; }
+
         if (overlay) {
           overlay.style.display = '';
           overlay.classList.add('active');
@@ -672,13 +821,13 @@
         if (ld2) ld2.style.display = 'none';
 
         if (photoUrls.length > 0) {
-          buildShuffleOrder();
+          resetPlaybackIndices();
           showNext();
         }
         onDone();
       }
 
-      step();
+      runStep();
     }
   }
 
@@ -712,9 +861,8 @@
   function getActive() { return document.getElementById(activeLayer === 'a' ? 'ff-layer-a' : 'ff-layer-b'); }
   function clearLayer(l) {
     if (!l) return;
-    // Stop any playing video
     const vid = l.querySelector('video');
-    if (vid) { vid.pause(); vid.src = ''; }
+    if (vid) { vid.pause(); vid.removeAttribute('src'); vid.load(); }
     KB.forEach(c => l.classList.remove(c));
     l.classList.remove('ff-kenburns', 'slide-enter', 'slide-exit', 'no-transition', 'ff-fill-cover');
     l.innerHTML = '';
@@ -739,8 +887,10 @@
     if (idx < 0 || idx >= photoUrls.length) return;
     if (errCount >= 10) { showStatus('Many items failed to load.'); errCount = 0; return; }
 
+    clearTimeout(videoTimer);
+
     const url = photoUrls[idx];
-    const item = mediaItems[idx]; // may have type info
+    const item = mediaItems[idx];
     const isVideo = item && item.type === 'video';
 
     if (brokenUrls.has(url)) { errCount++; setTimeout(showNext, 50); return; }
@@ -756,16 +906,33 @@
       video.playsInline = true;
       video.setAttribute('playsinline', '');
       video.setAttribute('autoplay', '');
+      // Start muted to satisfy autoplay policy, unmute once playback begins
       video.muted = true;
       video.setAttribute('muted', '');
+
+      // A stalled or seekless recording fires neither 'ended' nor 'error', which
+      // used to hang the slideshow forever. Always keep a wall-clock fallback.
+      let armed = true;
+      const advance = () => { if (armed) { armed = false; clearTimeout(videoTimer); showNext(); } };
+      videoTimer = setTimeout(advance, Math.max(settings.duration, 10) * 1000);
+
       video.onplaying = () => { if (!isMuted) video.muted = false; };
+      video.onloadedmetadata = () => {
+        const secs = (isFinite(video.duration) && video.duration > 0) ? video.duration : settings.duration;
+        clearTimeout(videoTimer);
+        videoTimer = setTimeout(advance, secs * 1000 + 2000);
+      };
       video.onloadeddata = () => {
         errCount = 0;
         swapLayers();
         video.play().catch(() => {});
       };
-      video.onended = () => { showNext(); };
-      video.onerror = () => { brokenUrls.add(url); errCount++; setTimeout(showNext, 200); };
+      video.onended = advance;
+      video.onerror = () => {
+        armed = false;
+        clearTimeout(videoTimer);
+        brokenUrls.add(url); errCount++; setTimeout(showNext, 200);
+      };
       video.src = url;
       layer.appendChild(video);
     } else {
@@ -779,6 +946,7 @@
 
   function showNext() {
     clearTimeout(slideTimer);
+    clearTimeout(videoTimer);
     if (historyPos >= 0 && historyPos < viewHistory.length - 1) { historyPos++; loadSlide(viewHistory[historyPos]); return; }
     const i = getNextIndex();
     if (i >= 0) {
@@ -789,6 +957,7 @@
   }
   function showPrev() {
     clearTimeout(slideTimer);
+    clearTimeout(videoTimer);
     if (!viewHistory.length || historyPos <= 0) return;
     historyPos--; loadSlide(viewHistory[historyPos]);
   }
@@ -817,7 +986,10 @@
     setTimeout(() => el.classList.remove('visible'), 4000);
   }
   function handleKeydown(e) {
-    if (!isRunning) return;
+    // During capture the overlay is hidden and arrow keys belong to iCloud —
+    // reacting to our own debugger-dispatched keys would advance the slideshow
+    // mid-capture and preventDefault iCloud's navigation.
+    if (!isRunning || isCapturing) return;
     if (e.key === 'Escape') { e.preventDefault(); stopSlideshow(); }
     else if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); showNext(); }
     else if (e.key === 'ArrowLeft') { e.preventDefault(); showPrev(); }
@@ -838,7 +1010,6 @@
       <div class="ff-settings-title">Settings</div>
       <div class="ff-setting"><span>Photo Fill</span>
         <select id="ff-set-fill"><option value="contain"${settings.fill==='contain'?' selected':''}>Fit</option><option value="cover"${settings.fill==='cover'?' selected':''}>Fill (crop)</option></select></div>
-      <div class="ff-setting"><span>Hi-Res</span><input type="checkbox" id="ff-set-hires"${settings.hiRes?' checked':''}></div>
       <div class="ff-setting"><span>Shuffle</span><input type="checkbox" id="ff-set-shuffle"${settings.shuffle?' checked':''}></div>
       <div class="ff-setting"><span>Transition</span>
         <select id="ff-set-transition"><option value="fade"${settings.transition==='fade'?' selected':''}>Fade</option><option value="slide"${settings.transition==='slide'?' selected':''}>Slide</option><option value="none"${settings.transition==='none'?' selected':''}>None</option></select></div>
@@ -869,10 +1040,9 @@
       const btn = document.getElementById('ff-mute');
       btn.innerHTML = isMuted ? '&#128263;' : '&#128264;';
       btn.title = isMuted ? 'Unmute' : 'Mute';
-      // Update any currently playing video
-      const activeLayer = getActive();
-      if (activeLayer) {
-        const vid = activeLayer.querySelector('video');
+      const active = getActive();
+      if (active) {
+        const vid = active.querySelector('video');
         if (vid) vid.muted = isMuted;
       }
     });
@@ -881,10 +1051,9 @@
     document.getElementById('ff-hide-current').addEventListener('click', e => {
       e.stopPropagation();
       if (currentIndex >= 0 && currentIndex < photoUrls.length) {
-        const url = photoUrls[currentIndex];
-        hiddenUrls.add(url);
+        hiddenUrls.add(photoUrls[currentIndex]);
         rebuildPhotoUrls();
-        buildShuffleOrder();
+        resetPlaybackIndices();
         updateHiddenCount();
         showStatus('Photo hidden (' + hiddenUrls.size + ' hidden)');
         showNext();
@@ -902,7 +1071,6 @@
       const a = getActive(); if (a) a.classList.toggle('ff-fill-cover', settings.fill === 'cover');
       saveExtSettings();
     });
-    document.getElementById('ff-set-hires').addEventListener('change', e => { settings.hiRes = e.target.checked; saveExtSettings(); });
     document.getElementById('ff-set-shuffle').addEventListener('change', e => { settings.shuffle = e.target.checked; if (settings.shuffle) buildShuffleOrder(); saveExtSettings(); });
     document.getElementById('ff-set-transition').addEventListener('change', e => { settings.transition = e.target.value; saveExtSettings(); });
     document.getElementById('ff-set-kenburns').addEventListener('change', e => { settings.kenBurns = e.target.checked; saveExtSettings(); });
@@ -918,16 +1086,18 @@
       if (hiddenUrls.size === 0) return;
       hiddenUrls.clear();
       rebuildPhotoUrls();
-      buildShuffleOrder();
+      resetPlaybackIndices();
       updateHiddenCount();
       showStatus('All photos unhidden');
+      showNext();
     });
 
+    updateHiddenCount();
     document.addEventListener('keydown', handleKeydown);
   }
 
   function removeOverlay() {
-    ['frameflow-overlay', 'frameflow-controls', 'ff-settings-panel', 'frameflow-status', 'frameflow-loader', 'ff-hires-progress'].forEach(id => {
+    ['frameflow-overlay', 'frameflow-controls', 'ff-settings-panel', 'frameflow-status', 'frameflow-loader', 'ff-hires-progress', 'ff-hires-instructions'].forEach(id => {
       const el = document.getElementById(id); if (el) el.remove();
     });
     document.removeEventListener('keydown', handleKeydown);
@@ -935,70 +1105,70 @@
 
   // ===== Start / Stop =====
   function startSlideshow(opts) {
-    if (opts) { if (!opts.fill) opts.fill = 'contain'; Object.assign(settings, opts); }
+    if (opts) Object.assign(settings, opts);
+    delete settings.hiRes; // capture is always hi-res as of 1.2.0
+    if (!settings.fill) settings.fill = 'contain';
 
     isRunning = true; isPaused = false;
     currentIndex = -1; activeLayer = 'a';
     viewHistory = []; historyPos = -1;
 
-    // Use cached photos if available
-    photoUrls = rebuildPhotoUrls();
+    rebuildPhotoUrls();
 
     createOverlay();
     document.getElementById('frameflow-overlay').classList.add('active');
 
     const countEl = document.getElementById('ff-photo-count');
     const labelEl = document.getElementById('ff-loader-label');
+    const target = resolveTarget(settings.targetPhotos);
 
-    if (settings.hiRes) {
-      // Skip re-capture if we already have enough
-      if (photoUrls.length >= (settings.targetPhotos || 10)) {
-        console.log('[FrameFlow] Using', photoUrls.length, 'cached photos');
-        if (countEl) countEl.textContent = photoUrls.length;
-        buildShuffleOrder();
-        const ld = document.getElementById('frameflow-loader');
-        if (ld) ld.style.display = 'none';
-        showNext();
-        return photoUrls.length;
-      }
-
-      if (countEl) countEl.textContent = '0';
-      if (labelEl) labelEl.textContent = 'click any photo in iCloud to begin...';
-
-      loadHiResPhotos(settings.targetPhotos || 10, (count) => {
-        if (countEl) countEl.textContent = count + ' / ' + (settings.targetPhotos || 10);
-        photoUrls = rebuildPhotoUrls();
-      }, () => {
-        photoUrls = rebuildPhotoUrls();
-        showStatus(photoUrls.length + ' photos captured');
-        const ld = document.getElementById('frameflow-loader');
-        if (ld) ld.style.display = 'none';
-        if (currentIndex < 0 && photoUrls.length > 0) {
-          buildShuffleOrder(); showNext();
-        }
-      });
-    } else {
-      if (countEl) countEl.textContent = photoUrls.length || '0';
-      if (labelEl) labelEl.textContent = 'no thumbnail scraping available (iCloud uses blob URLs)';
-      if (photoUrls.length > 0) {
-        buildShuffleOrder();
-        const ld = document.getElementById('frameflow-loader');
-        if (ld) ld.style.display = 'none';
-        showNext();
-      } else {
-        showStatus('Enable Hi-Res mode to capture photos from iCloud');
-      }
+    // Reuse the cache from an earlier run rather than re-capturing. "All" reuses
+    // whatever we already have; reload the page to force a fresh capture.
+    const haveEnough = photoUrls.length > 0 && (target === Infinity || photoUrls.length >= target);
+    if (haveEnough) {
+      console.log('[FrameFlow] Using', photoUrls.length, 'cached items');
+      if (countEl) countEl.textContent = photoUrls.length;
+      buildShuffleOrder();
+      const ld = document.getElementById('frameflow-loader');
+      if (ld) ld.style.display = 'none';
+      showNext();
+      return photoUrls.length;
     }
+
+    if (countEl) countEl.textContent = '0';
+    if (labelEl) labelEl.textContent = 'click any photo in iCloud to begin...';
+
+    loadHiResPhotos(target, (count) => {
+      if (countEl) countEl.textContent = count + ' / ' + targetLabel(target);
+      rebuildPhotoUrls();
+    }, () => {
+      rebuildPhotoUrls();
+      if (!isRunning) return;
+      showStatus(photoUrls.length + ' items captured');
+      const ld = document.getElementById('frameflow-loader');
+      if (ld) ld.style.display = 'none';
+      if (currentIndex < 0 && photoUrls.length > 0) {
+        resetPlaybackIndices();
+        showNext();
+      }
+    });
 
     return photoUrls.length;
   }
 
   function stopSlideshow() {
-    isRunning = false; isPaused = false;
+    isRunning = false; isPaused = false; isCapturing = false;
     clearTimeout(slideTimer); clearTimeout(scrollTimer);
+    clearTimeout(waitTimer); clearTimeout(videoTimer); clearTimeout(controlsTimer);
+    waitTimer = null;
+    // Unblock anything awaiting an iframe response so the capture loop can exit
+    settleAll(null);
+    showICloudChrome();
+    sendMessage({ type: 'DEBUGGER_DETACH' });
     removeOverlay();
     currentIndex = -1;
-    // Don't clear collectedUrls — cache persists
+    viewHistory = []; historyPos = -1;
+    // Captured media is intentionally kept so restarting is instant
   }
 
   // ===== Message Handler =====
@@ -1008,13 +1178,12 @@
       const count = collectedMedia.length > 0 ? collectedMedia.length : iframePhotoPositions.length;
       sendResponse({ ok: true, running: isRunning, photoCount: count });
     } else if (msg.type === 'START_SLIDESHOW') {
-      const count = startSlideshow(msg.settings);
-      sendResponse({ ok: true, photoCount: count });
+      sendResponse({ ok: true, photoCount: startSlideshow(msg.settings) });
     } else if (msg.type === 'STOP_SLIDESHOW') {
       stopSlideshow();
       sendResponse({ ok: true });
     }
-    return true;
+    // All responses are synchronous — returning true would leak the message port.
   });
 
   console.log('[FrameFlow] Top frame ready. Waiting for iframe photo positions...');
