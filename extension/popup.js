@@ -77,7 +77,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
   }
 
   // Ping content script to check status
-  chrome.tabs.sendMessage(tab.id, { type: 'PING' }, (response) => {
+  chrome.tabs.sendMessage(tab.id, { type: 'PING' }, { frameId: 0 }, (response) => {
     if (chrome.runtime.lastError || !response) {
       setStatus('Reload the iCloud Photos page, then try again', 'error');
       btnStart.disabled = true;
@@ -107,7 +107,7 @@ btnStart.addEventListener('click', () => {
   chrome.tabs.sendMessage(currentTabId, {
     type: 'START_SLIDESHOW',
     settings: getSettings()
-  }, (response) => {
+  }, { frameId: 0 }, (response) => {
     if (chrome.runtime.lastError) {
       setStatus('Error: ' + chrome.runtime.lastError.message, 'error');
       return;
@@ -123,7 +123,7 @@ btnStart.addEventListener('click', () => {
 btnStop.addEventListener('click', () => {
   if (!currentTabId) return;
 
-  chrome.tabs.sendMessage(currentTabId, { type: 'STOP_SLIDESHOW' }, (response) => {
+  chrome.tabs.sendMessage(currentTabId, { type: 'STOP_SLIDESHOW' }, { frameId: 0 }, (response) => {
     if (chrome.runtime.lastError) {
       setStatus('Error: ' + chrome.runtime.lastError.message, 'error');
       return;
