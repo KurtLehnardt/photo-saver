@@ -69,8 +69,43 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   attached.delete(tabId);
 });
 
+// Re-fetch a photo the page already loaded. iCloud serves photos from
+// *.icloud-content.com, which taints a canvas in the page and makes toDataURL()
+// throw — but a service-worker fetch carries the extension's host permissions
+// and is not subject to page CORS, so this yields the real full-resolution
+// image instead of a cropped screenshot of the viewport.
+const MAX_IMAGE_BYTES = 24 * 1024 * 1024;
+
+async function fetchImageAsDataUrl(url) {
+  const res = await fetch(url, { credentials: 'include' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const blob = await res.blob();
+  if (blob.size > MAX_IMAGE_BYTES) throw new Error('too large: ' + blob.size);
+  if (blob.type && !blob.type.startsWith('image/')) throw new Error('not an image: ' + blob.type);
+
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  // btoa in 32KB chunks — String.fromCharCode blows the stack on a whole photo
+  let binary = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return 'data:' + (blob.type || 'image/jpeg') + ';base64,' + btoa(binary);
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender.tab && sender.tab.id;
+
+  if (msg.type === 'FETCH_IMAGE') {
+    let url;
+    try { url = new URL(msg.url); } catch (e) { sendResponse({ dataUrl: null, error: 'bad url' }); return; }
+    if (url.protocol !== 'https:') { sendResponse({ dataUrl: null, error: 'not https' }); return; }
+    fetchImageAsDataUrl(url.href)
+      .then(dataUrl => sendResponse({ dataUrl }))
+      .catch(e => sendResponse({ dataUrl: null, error: e.message }));
+    return true; // async
+  }
 
   if (msg.type === 'CAPTURE_TAB') {
     // Capture the window the sender actually lives in — captureVisibleTab(null)

@@ -84,37 +84,69 @@
       return iframeCanvas.toDataURL('image/jpeg', 0.95);
     }
 
+    // Only works for same-origin sources; iCloud's cross-origin photos taint the
+    // canvas and make toDataURL() throw.
+    function tryCanvas(img) {
+      try {
+        return encodeImage(img);
+      } catch (e) {
+        if (!captureLogged) {
+          console.log('[FrameFlow/iframe] Canvas blocked (' + e.message.slice(0, 40) + '), using background fetch');
+          captureLogged = true;
+        }
+        return null;
+      }
+    }
+
+    // The service worker carries the extension's host permissions, so it can
+    // refetch the photo cross-origin and hand back the original full-resolution
+    // bytes. This is the primary path on real iCloud.
+    function fetchViaBackground(url) {
+      return new Promise(resolve => {
+        try {
+          chrome.runtime.sendMessage({ type: 'FETCH_IMAGE', url }, resp => {
+            if (chrome.runtime.lastError || !resp) { resolve(null); return; }
+            if (!resp.dataUrl && resp.error) console.log('[FrameFlow/iframe] Fetch failed:', resp.error);
+            resolve(resp.dataUrl || null);
+          });
+        } catch (e) { resolve(null); }
+      });
+    }
+
     // Poll until a *new* image shows up (iCloud swaps the <img> asynchronously
     // after an arrow key), then respond. Always answers, so the top frame's
     // request never has to rely on a timeout to make progress.
     function captureLargestImage(requestId, deadlineMs) {
       const deadline = Date.now() + (deadlineMs || 1500);
 
-      function attempt() {
+      async function attempt() {
         const best = findLargestImage();
         if (best) {
-          const key = (best.src || '') + '_' + best.naturalWidth + 'x' + best.naturalHeight;
-          if (key !== lastCapturedKey) {
-            try {
-              const dataUrl = encodeImage(best);
-              if (dataUrl && dataUrl.length > 1000) {
-                lastCapturedKey = key;
-                postToTop({
-                  type: 'FRAMEFLOW_PHOTO_DATA',
-                  requestId,
-                  dataUrl,
-                  width: best.naturalWidth,
-                  height: best.naturalHeight
-                });
-                console.log('[FrameFlow/iframe] Captured', best.naturalWidth + 'x' + best.naturalHeight, 'image');
-                return;
-              }
-            } catch (e) {
-              if (!captureLogged) {
-                console.log('[FrameFlow/iframe] Canvas capture failed:', e.message);
-                captureLogged = true;
-              }
-              postToTop({ type: 'FRAMEFLOW_PHOTO_DATA', requestId, dataUrl: null });
+          const src = best.currentSrc || best.src || '';
+          const key = src + '_' + best.naturalWidth + 'x' + best.naturalHeight;
+          if (src && key !== lastCapturedKey) {
+            let dataUrl = null, via = '';
+
+            if (src.startsWith('blob:') || src.startsWith('data:')) {
+              dataUrl = tryCanvas(best);
+              via = 'canvas';
+            } else if (/^https:/.test(src)) {
+              dataUrl = await fetchViaBackground(src);
+              via = 'fetch';
+              if (!dataUrl) { dataUrl = tryCanvas(best); via = 'canvas'; }
+            }
+
+            if (dataUrl && dataUrl.length > 1000) {
+              lastCapturedKey = key;
+              postToTop({
+                type: 'FRAMEFLOW_PHOTO_DATA',
+                requestId,
+                dataUrl,
+                width: best.naturalWidth,
+                height: best.naturalHeight
+              });
+              console.log('[FrameFlow/iframe] Captured', best.naturalWidth + 'x' + best.naturalHeight,
+                'via ' + via);
               return;
             }
           }
@@ -456,8 +488,8 @@
 
   function requestIframeCapture(timeoutMs) {
     const id = 'ff' + (++reqSeq);
-    const ms = timeoutMs || 2500;
-    if (!postToFrames({ type: 'FRAMEFLOW_REQUEST_CAPTURE', requestId: id, deadline: ms - 400 })) {
+    const ms = timeoutMs || 8000;
+    if (!postToFrames({ type: 'FRAMEFLOW_REQUEST_CAPTURE', requestId: id, deadline: ms - 1200 })) {
       return Promise.resolve(null);
     }
     return awaitResponse(id, ms, null);
@@ -504,51 +536,91 @@
   const cropCanvas = document.createElement('canvas');
   const cropCtx = cropCanvas.getContext('2d');
 
-  // Hide iCloud's UI overlays before screenshot, restore after
-  function hideiCloudChrome() {
-    let style = document.getElementById('ff-hide-icloud');
-    if (!style) {
-      style = document.createElement('style');
-      style.id = 'ff-hide-icloud';
-      document.head.appendChild(style);
-    }
-    style.textContent = `
-      .OneUp-leadingTopBadges, .OneUp-trailingTopBadges,
-      .OneUpBadge, .OneUp-hdrVideoBadge,
-      .OneUp-toolbar, .OneUp-bottomBar,
-      .FilmStrip, .film-strip, [class*="filmstrip"],
-      [class*="TopBar"], [class*="topbar"],
-      [class*="toolbar"], [class*="Toolbar"],
-      [class*="navigation"], [class*="Navigation"],
-      [class*="close-button"], [class*="CloseButton"] {
-        display: none !important;
-        opacity: 0 !important;
-        visibility: hidden !important;
-      }
-    `;
+  // Hide iCloud's UI overlays before screenshot, restore after.
+  // These selectors match on class substrings, which also hit container
+  // elements — blanking an ancestor of the photo produced all-black captures.
+  const ICLOUD_CHROME_SELECTOR = [
+    '.OneUp-leadingTopBadges', '.OneUp-trailingTopBadges',
+    '.OneUpBadge', '.OneUp-hdrVideoBadge',
+    '.OneUp-toolbar', '.OneUp-bottomBar',
+    '.FilmStrip', '.film-strip', '[class*="filmstrip"]',
+    '[class*="TopBar"]', '[class*="topbar"]',
+    '[class*="toolbar"]', '[class*="Toolbar"]',
+    '[class*="navigation"]', '[class*="Navigation"]',
+    '[class*="close-button"]', '[class*="CloseButton"]'
+  ].join(',');
+
+  // [element, previous inline visibility] for everything hidden for a shot
+  let hiddenForShot = [];
+
+  function sameOriginDocs() {
+    const docs = [document];
     document.querySelectorAll('iframe').forEach(f => {
-      try {
-        if (!f.contentDocument || !f.contentDocument.head) return;
-        let iStyle = f.contentDocument.getElementById('ff-hide-icloud');
-        if (!iStyle) {
-          iStyle = f.contentDocument.createElement('style');
-          iStyle.id = 'ff-hide-icloud';
-          f.contentDocument.head.appendChild(iStyle);
-        }
-        iStyle.textContent = style.textContent;
-      } catch (e) {}
+      try { if (f.contentDocument) docs.push(f.contentDocument); } catch (e) {}
+    });
+    return docs;
+  }
+
+  // Never hide anything the photo lives inside.
+  function mediaAncestors(doc) {
+    const keep = new Set();
+    let best = null, bestArea = 0;
+    doc.querySelectorAll('img,video').forEach(el => {
+      const r = el.getBoundingClientRect();
+      const area = r.width * r.height;
+      if (area > bestArea) { bestArea = area; best = el; }
+    });
+    for (let n = best; n; n = n.parentElement) keep.add(n);
+    return keep;
+  }
+
+  function hideiCloudChrome() {
+    showICloudChrome(); // never stack two hides
+    sameOriginDocs().forEach(doc => {
+      const keep = mediaAncestors(doc);
+      let els;
+      try { els = doc.querySelectorAll(ICLOUD_CHROME_SELECTOR); } catch (e) { return; }
+      els.forEach(el => {
+        if (keep.has(el)) return;
+        if (el.closest && el.closest('#frameflow-overlay')) return;
+        hiddenForShot.push([el, el.style.visibility]);
+        // visibility, not display: display:none reflows the page between the
+        // hide and the capture, shifting the photo out from under the crop.
+        el.style.visibility = 'hidden';
+      });
     });
   }
 
   function showICloudChrome() {
-    const style = document.getElementById('ff-hide-icloud');
-    if (style) style.textContent = '';
-    document.querySelectorAll('iframe').forEach(f => {
-      try {
-        const iStyle = f.contentDocument.getElementById('ff-hide-icloud');
-        if (iStyle) iStyle.textContent = '';
-      } catch (e) {}
+    hiddenForShot.forEach(([el, prev]) => {
+      try { el.style.visibility = prev; } catch (e) {}
     });
+    hiddenForShot = [];
+    // Clear the stylesheet written by versions <= 1.2.0, if one is left behind
+    const stale = document.getElementById('ff-hide-icloud');
+    if (stale) stale.textContent = '';
+  }
+
+  // Downscale to 32x32 and average: a near-black frame means we hid something
+  // we should not have, or the page repainted mid-capture.
+  const sampleCanvas = document.createElement('canvas');
+  sampleCanvas.width = 32; sampleCanvas.height = 32;
+  const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+  let blankWarned = false;
+  function warnIfBlank(src) {
+    if (blankWarned) return;
+    try {
+      sampleCtx.drawImage(src, 0, 0, 32, 32);
+      const d = sampleCtx.getImageData(0, 0, 32, 32).data;
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4) sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
+      const mean = sum / (d.length / 4);
+      if (mean < 8) {
+        blankWarned = true;
+        console.warn('[FrameFlow] Screenshot is blank (mean brightness ' + mean.toFixed(1) +
+          ') — the photo was hidden or had not painted when the frame was taken');
+      }
+    } catch (e) {}
   }
 
   async function captureScreenshot() {
@@ -579,6 +651,8 @@
         cropCanvas.width = cw;
         cropCanvas.height = ch;
         cropCtx.drawImage(img, sideCrop, topCrop, cw, ch, 0, 0, cw, ch);
+
+        warnIfBlank(cropCanvas);
 
         cropCanvas.toBlob(blob => {
           resolve(blob ? URL.createObjectURL(blob) : resp.dataUrl);
@@ -721,7 +795,7 @@
           } else {
             // Video recording failed — capture a screenshot instead
             console.log('[FrameFlow] Video recording failed, capturing screenshot');
-            let dataUrl = await requestIframeCapture(2500);
+            let dataUrl = await requestIframeCapture(8000);
             if (!dataUrl) {
               progressDiv.style.display = 'none';
               await new Promise(r => setTimeout(r, 150));
@@ -735,7 +809,7 @@
             staleCount++;
           }
         } else {
-          let dataUrl = await requestIframeCapture(2500);
+          let dataUrl = await requestIframeCapture(8000);
           if (!dataUrl) {
             progressDiv.style.display = 'none';
             await new Promise(r => setTimeout(r, 150));
@@ -771,9 +845,10 @@
         const keyOk = await sendRealKey('ArrowRight');
         if (keyOk) {
           keyFailures = 0;
-        } else if (++keyFailures >= 2) {
-          // Without chrome.debugger we cannot advance iCloud, and every further
-          // round would just re-capture the same photo. Stop and say why.
+        } else if (++keyFailures >= 2 && staleCount > 0) {
+          // Only give up if we are also failing to capture anything new. The
+          // synthetic-key fallback does advance some pages, and aborting while
+          // photos are still arriving would cut a working run short.
           console.warn('[FrameFlow] Cannot dispatch keys — aborting capture');
           progress('Cannot advance photos — close DevTools for this tab and retry');
           await new Promise(r => setTimeout(r, 2500));
@@ -808,7 +883,9 @@
         isCapturing = false;
 
         rebuildPhotoUrls();
-        console.log('[FrameFlow] Captured', count, 'items');
+        const kinds = {};
+        collectedMedia.forEach(m => { const k = m.type + ':' + urlKind(m.url); kinds[k] = (kinds[k] || 0) + 1; });
+        console.log('[FrameFlow] Captured', count, 'items —', JSON.stringify(kinds));
 
         // The user may have stopped the slideshow mid-capture — don't resurrect it
         if (!isRunning) { onDone(); return; }
@@ -882,6 +959,29 @@
     activeLayer = activeLayer === 'a' ? 'b' : 'a';
   }
 
+  function urlKind(u) {
+    if (typeof u !== 'string') return 'none';
+    const i = u.indexOf(':');
+    return i > 0 ? u.slice(0, i) : 'unknown';
+  }
+
+  // A slide can load perfectly and still be invisible if something paints over it
+  // — iCloud's app frame, or a fullscreen element in the top layer. Report it
+  // once per run rather than leaving the user with a silent black screen.
+  let overlayChecked = false;
+  function checkOverlayOnTop() {
+    if (overlayChecked) return;
+    overlayChecked = true;
+    const ov = document.getElementById('frameflow-overlay');
+    if (!ov) return;
+    const el = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+    if (el && ov.contains(el)) return;
+    const what = el ? el.tagName + (el.id ? '#' + el.id : '') + ' .' + (el.className || '') : 'nothing';
+    console.warn('[FrameFlow] Overlay is not the topmost element — ' + what.slice(0, 80) +
+      ' is painting over the slideshow');
+    showStatus('Slideshow is hidden behind the page');
+  }
+
   let errCount = 0;
   function loadSlide(idx) {
     if (idx < 0 || idx >= photoUrls.length) return;
@@ -937,8 +1037,22 @@
       layer.appendChild(video);
     } else {
       const img = document.createElement('img');
-      img.onload = () => { errCount = 0; applyKenBurns(layer); swapLayers(); scheduleNext(); };
-      img.onerror = () => { brokenUrls.add(url); errCount++; setTimeout(showNext, 200); };
+      img.onload = () => {
+        errCount = 0;
+        console.log('[FrameFlow] slide ' + idx + ' loaded ' + img.naturalWidth + 'x' + img.naturalHeight +
+          ' (' + urlKind(url) + ')');
+        applyKenBurns(layer);
+        swapLayers();
+        scheduleNext();
+        checkOverlayOnTop();
+      };
+      img.onerror = () => {
+        // Silent before: a black screen with an empty console looked identical
+        // to "capture produced nothing".
+        console.warn('[FrameFlow] slide ' + idx + ' FAILED to load (' + urlKind(url) + ') — ' +
+          url.slice(0, 60));
+        brokenUrls.add(url); errCount++; setTimeout(showNext, 200);
+      };
       img.src = url;
       layer.appendChild(img);
     }
@@ -1110,6 +1224,7 @@
     if (!settings.fill) settings.fill = 'contain';
 
     isRunning = true; isPaused = false;
+    overlayChecked = false; blankWarned = false;
     currentIndex = -1; activeLayer = 'a';
     viewHistory = []; historyPos = -1;
 
