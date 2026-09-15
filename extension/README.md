@@ -27,17 +27,33 @@ settings, exit). `Esc` exits, arrow keys step, space advances.
 
 ## How capture works
 
-iCloud serves photos as same-origin `blob:` URLs inside a nested frame, so there
-is no image URL to collect. FrameFlow instead:
+iCloud renders its app inside a nested frame at
+`https://www.icloud.com/applications/photos3/...`, and serves the photos
+themselves from `*.icloud-content.com`. FrameFlow runs a content script in every
+frame (`all_frames: true`) and captures the open photo in this order:
 
-- runs a content script in every frame (`all_frames: true`)
-- has the **frame** instance draw the open photo to a canvas and hand the encoded
-  JPEG to the top frame (`postMessage`, targeted at `https://www.icloud.com` so
-  the page's own scripts can't read it)
-- falls back to `chrome.tabs.captureVisibleTab` + a fixed crop when the canvas
-  route fails
-- records videos with `MediaRecorder` off a `captureStream()` of the `<video>`
-- advances iCloud with a real `ArrowRight` via `chrome.debugger`
+1. **Service-worker refetch (primary).** The frame reads the open `<img>`'s
+   `currentSrc` and asks the background worker to fetch it. The worker carries the
+   extension's host permissions and is not subject to page CORS, so this returns
+   the **original full-resolution photo**.
+2. **Canvas encode.** Used when the source is already same-origin (`blob:` /
+   `data:`). Cross-origin sources taint the canvas and make `toDataURL()` throw,
+   which is why this cannot be the primary path on iCloud.
+3. **Cropped screenshot.** Last resort — `chrome.tabs.captureVisibleTab` plus a
+   fixed crop. Lower quality, and only produces a real image when the window is
+   actually on screen.
+
+Photo data is handed to the top frame with `postMessage` targeted at
+`https://www.icloud.com`, so iCloud's own page scripts can't read it.
+
+Videos are recorded with `MediaRecorder` off a `captureStream()` of the `<video>`.
+iCloud is advanced with a real `ArrowRight` via `chrome.debugger`.
+
+### Why the host permissions
+
+`*.icloud-content.com` and `*.cdn-apple.com` are where Apple serves the actual
+image bytes. Without permission for those origins the worker cannot refetch a
+photo, and capture falls back to screenshots of the viewport.
 
 ### Why the `debugger` permission
 
@@ -53,6 +69,9 @@ synthetic events, which usually will not advance iCloud.
 - Captured media is held in memory and reused if you restart the slideshow.
   **Reload the page to force a fresh capture.** At most 2000 items are retained;
   older ones are dropped and their blob URLs released.
+- If the console warns `Screenshot is blank` or `Overlay is not the topmost
+  element`, capture or display is being blocked — those two cases used to fail
+  silently as a black screen.
 - "All (slow)" captures until iCloud stops producing new photos (8 consecutive
   empty rounds).
 - Capture runs at roughly one item every 2s — 100 photos takes ~3.5 minutes.

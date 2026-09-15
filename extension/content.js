@@ -84,37 +84,69 @@
       return iframeCanvas.toDataURL('image/jpeg', 0.95);
     }
 
+    // Only works for same-origin sources; iCloud's cross-origin photos taint the
+    // canvas and make toDataURL() throw.
+    function tryCanvas(img) {
+      try {
+        return encodeImage(img);
+      } catch (e) {
+        if (!captureLogged) {
+          console.log('[FrameFlow/iframe] Canvas blocked (' + e.message.slice(0, 40) + '), using background fetch');
+          captureLogged = true;
+        }
+        return null;
+      }
+    }
+
+    // The service worker carries the extension's host permissions, so it can
+    // refetch the photo cross-origin and hand back the original full-resolution
+    // bytes. This is the primary path on real iCloud.
+    function fetchViaBackground(url) {
+      return new Promise(resolve => {
+        try {
+          chrome.runtime.sendMessage({ type: 'FETCH_IMAGE', url }, resp => {
+            if (chrome.runtime.lastError || !resp) { resolve(null); return; }
+            if (!resp.dataUrl && resp.error) console.log('[FrameFlow/iframe] Fetch failed:', resp.error);
+            resolve(resp.dataUrl || null);
+          });
+        } catch (e) { resolve(null); }
+      });
+    }
+
     // Poll until a *new* image shows up (iCloud swaps the <img> asynchronously
     // after an arrow key), then respond. Always answers, so the top frame's
     // request never has to rely on a timeout to make progress.
     function captureLargestImage(requestId, deadlineMs) {
       const deadline = Date.now() + (deadlineMs || 1500);
 
-      function attempt() {
+      async function attempt() {
         const best = findLargestImage();
         if (best) {
-          const key = (best.src || '') + '_' + best.naturalWidth + 'x' + best.naturalHeight;
-          if (key !== lastCapturedKey) {
-            try {
-              const dataUrl = encodeImage(best);
-              if (dataUrl && dataUrl.length > 1000) {
-                lastCapturedKey = key;
-                postToTop({
-                  type: 'FRAMEFLOW_PHOTO_DATA',
-                  requestId,
-                  dataUrl,
-                  width: best.naturalWidth,
-                  height: best.naturalHeight
-                });
-                console.log('[FrameFlow/iframe] Captured', best.naturalWidth + 'x' + best.naturalHeight, 'image');
-                return;
-              }
-            } catch (e) {
-              if (!captureLogged) {
-                console.log('[FrameFlow/iframe] Canvas capture failed:', e.message);
-                captureLogged = true;
-              }
-              postToTop({ type: 'FRAMEFLOW_PHOTO_DATA', requestId, dataUrl: null });
+          const src = best.currentSrc || best.src || '';
+          const key = src + '_' + best.naturalWidth + 'x' + best.naturalHeight;
+          if (src && key !== lastCapturedKey) {
+            let dataUrl = null, via = '';
+
+            if (src.startsWith('blob:') || src.startsWith('data:')) {
+              dataUrl = tryCanvas(best);
+              via = 'canvas';
+            } else if (/^https:/.test(src)) {
+              dataUrl = await fetchViaBackground(src);
+              via = 'fetch';
+              if (!dataUrl) { dataUrl = tryCanvas(best); via = 'canvas'; }
+            }
+
+            if (dataUrl && dataUrl.length > 1000) {
+              lastCapturedKey = key;
+              postToTop({
+                type: 'FRAMEFLOW_PHOTO_DATA',
+                requestId,
+                dataUrl,
+                width: best.naturalWidth,
+                height: best.naturalHeight
+              });
+              console.log('[FrameFlow/iframe] Captured', best.naturalWidth + 'x' + best.naturalHeight,
+                'via ' + via);
               return;
             }
           }
@@ -456,8 +488,8 @@
 
   function requestIframeCapture(timeoutMs) {
     const id = 'ff' + (++reqSeq);
-    const ms = timeoutMs || 2500;
-    if (!postToFrames({ type: 'FRAMEFLOW_REQUEST_CAPTURE', requestId: id, deadline: ms - 400 })) {
+    const ms = timeoutMs || 8000;
+    if (!postToFrames({ type: 'FRAMEFLOW_REQUEST_CAPTURE', requestId: id, deadline: ms - 1200 })) {
       return Promise.resolve(null);
     }
     return awaitResponse(id, ms, null);
@@ -763,7 +795,7 @@
           } else {
             // Video recording failed — capture a screenshot instead
             console.log('[FrameFlow] Video recording failed, capturing screenshot');
-            let dataUrl = await requestIframeCapture(2500);
+            let dataUrl = await requestIframeCapture(8000);
             if (!dataUrl) {
               progressDiv.style.display = 'none';
               await new Promise(r => setTimeout(r, 150));
@@ -777,7 +809,7 @@
             staleCount++;
           }
         } else {
-          let dataUrl = await requestIframeCapture(2500);
+          let dataUrl = await requestIframeCapture(8000);
           if (!dataUrl) {
             progressDiv.style.display = 'none';
             await new Promise(r => setTimeout(r, 150));
@@ -813,9 +845,10 @@
         const keyOk = await sendRealKey('ArrowRight');
         if (keyOk) {
           keyFailures = 0;
-        } else if (++keyFailures >= 2) {
-          // Without chrome.debugger we cannot advance iCloud, and every further
-          // round would just re-capture the same photo. Stop and say why.
+        } else if (++keyFailures >= 2 && staleCount > 0) {
+          // Only give up if we are also failing to capture anything new. The
+          // synthetic-key fallback does advance some pages, and aborting while
+          // photos are still arriving would cut a working run short.
           console.warn('[FrameFlow] Cannot dispatch keys — aborting capture');
           progress('Cannot advance photos — close DevTools for this tab and retry');
           await new Promise(r => setTimeout(r, 2500));
